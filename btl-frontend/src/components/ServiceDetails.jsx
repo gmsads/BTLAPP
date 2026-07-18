@@ -14,7 +14,16 @@ const ServiceDetails = ({ service, onBack, onUpdate, userRole = 'worker', curren
     startReading: '',
     endReading: ''
   });
-  const [readingImageFile, setReadingImageFile] = useState(null);
+  const [startReadingImage, setStartReadingImage] = useState(null);
+  const [endReadingImage, setEndReadingImage] = useState(null);
+  
+  // Image modal states
+  const [imageModal, setImageModal] = useState({
+    open: false,
+    imageUrl: '',
+    imageType: '', // 'start' or 'end'
+    readingDay: null
+  });
 
   // Blue/Yellow/White color palette
   const colors = {
@@ -40,7 +49,7 @@ const ServiceDetails = ({ service, onBack, onUpdate, userRole = 'worker', curren
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // Initialize meter readings from service data or create empty array
+  // Initialize meter readings from service data
   useEffect(() => {
     if (currentService && currentService.meterReadings) {
       setMeterReadings(currentService.meterReadings);
@@ -60,7 +69,27 @@ const ServiceDetails = ({ service, onBack, onUpdate, userRole = 'worker', curren
     }
   };
 
-  // UPDATED: handleAddReading with optional image upload
+  // Open image modal
+  const openImageModal = (imageUrl, imageType, readingDay) => {
+    setImageModal({
+      open: true,
+      imageUrl: imageUrl,
+      imageType: imageType,
+      readingDay: readingDay
+    });
+  };
+
+  // Close image modal
+  const closeImageModal = () => {
+    setImageModal({
+      open: false,
+      imageUrl: '',
+      imageType: '',
+      readingDay: null
+    });
+  };
+
+  // ===== handleAddReading =====
   const handleAddReading = async () => {
     // Validate readings
     if (!newReading.startReading || !newReading.endReading) {
@@ -73,37 +102,39 @@ const ServiceDetails = ({ service, onBack, onUpdate, userRole = 'worker', curren
       return;
     }
 
-    // Image is now OPTIONAL - show warning but don't block
-    if (!readingImageFile) {
-      setMessage('⚠️ No proof photo selected. You can continue without photo, but it\'s recommended to add one.');
-      // Allow proceeding without image
+    setLoading(true);
+    
+    const serviceId = service?._originalId || service?._id;
+    
+    if (!serviceId) {
+      setMessage('❌ Service ID is missing');
+      setLoading(false);
+      return;
     }
 
-    setLoading(true);
     try {
       const formData = new FormData();
       formData.append('startReading', newReading.startReading);
       formData.append('endReading', newReading.endReading);
       
-      // Only append image if one is selected
-      if (readingImageFile) {
-        formData.append('image', readingImageFile);
+      if (startReadingImage) {
+        formData.append('startImage', startReadingImage);
       }
-
-      // Make sure the service ID exists - use currentService._id instead of service._id
-      const serviceId = currentService?._id || service?._originalId || service?._id;
       
-      if (!serviceId) {
-        throw new Error('Service ID is missing');
+      if (endReadingImage) {
+        formData.append('endImage', endReadingImage);
       }
 
-      console.log('Adding meter reading to service:', serviceId);
+      console.log('📤 Adding meter reading to service:', serviceId);
       
       const response = await axios.post(`/services/${serviceId}/meter-readings`, formData, {
         headers: {
           'Content-Type': 'multipart/form-data'
-        }
+        },
+        timeout: 30000
       });
+
+      console.log('✅ Response:', response.data);
 
       if (response.data.success) {
         setMeterReadings(response.data.service.meterReadings || []);
@@ -112,9 +143,10 @@ const ServiceDetails = ({ service, onBack, onUpdate, userRole = 'worker', curren
           startReading: '',
           endReading: ''
         });
-        setReadingImageFile(null);
+        setStartReadingImage(null);
+        setEndReadingImage(null);
         setShowAddReading(false);
-        setMessage('✅ Meter reading added successfully!');
+        setMessage(response.data.message || '✅ Meter reading added successfully!');
         setTimeout(() => setMessage(''), 3000);
         
         if (onUpdate) {
@@ -124,37 +156,52 @@ const ServiceDetails = ({ service, onBack, onUpdate, userRole = 'worker', curren
         setMessage('❌ Failed to add meter reading: ' + (response.data.message || 'Unknown error'));
       }
     } catch (error) {
-      console.error('Error adding meter reading:', error);
-      if (error.response?.status === 404) {
-        setMessage(`❌ Service not found. Please refresh and try again.`);
-      } else if (error.response?.status === 403) {
-        setMessage('❌ You don\'t have permission to add readings to this service.');
+      console.error('❌ Error adding meter reading:', error);
+      
+      if (error.response) {
+        if (error.response.status === 404) {
+          setMessage(`❌ Service not found. Please refresh and try again.`);
+        } else if (error.response.status === 403) {
+          setMessage('❌ You don\'t have permission to add readings to this service.');
+        } else if (error.response.data?.message) {
+          setMessage('❌ ' + error.response.data.message);
+        } else {
+          setMessage('❌ Server error: ' + error.response.status);
+        }
+      } else if (error.code === 'ECONNABORTED') {
+        setMessage('❌ Request timed out. Please try again.');
+      } else if (error.message) {
+        setMessage('❌ Error adding meter reading: ' + error.message);
       } else {
-        setMessage('Error adding meter reading: ' + (error.response?.data?.message || error.message));
+        setMessage('❌ An unknown error occurred. Please try again.');
       }
     } finally {
       setLoading(false);
     }
   };
 
-  // UPDATED: handleDeleteReading with proper service ID
+  // ===== handleDeleteReading =====
   const handleDeleteReading = async (index) => {
     if (!window.confirm('Are you sure you want to delete this reading?')) return;
 
     setLoading(true);
+    
+    const serviceId = service?._originalId || service?._id;
+    
+    if (!serviceId) {
+      setMessage('❌ Service ID is missing');
+      setLoading(false);
+      return;
+    }
+
     try {
       const readingId = meterReadings[index]?._id;
-      const serviceId = currentService?._id || service?._originalId || service?._id;
-      
-      if (!serviceId) {
-        throw new Error('Service ID is missing');
-      }
       
       if (!readingId) {
         throw new Error('Reading ID is missing');
       }
       
-      console.log('Deleting meter reading from service:', serviceId, 'Reading ID:', readingId);
+      console.log('🗑️ Deleting meter reading from service:', serviceId, 'Reading ID:', readingId);
       
       const response = await axios.delete(`/services/${serviceId}/meter-readings/${readingId}`);
 
@@ -171,13 +218,20 @@ const ServiceDetails = ({ service, onBack, onUpdate, userRole = 'worker', curren
         setMessage('❌ Failed to delete meter reading: ' + (response.data.message || 'Unknown error'));
       }
     } catch (error) {
-      console.error('Error deleting meter reading:', error);
-      if (error.response?.status === 404) {
-        setMessage('❌ Service or reading not found. Please refresh and try again.');
-      } else if (error.response?.status === 403) {
-        setMessage('❌ You don\'t have permission to delete this reading.');
+      console.error('❌ Error deleting meter reading:', error);
+      
+      if (error.response) {
+        if (error.response.status === 404) {
+          setMessage(`❌ Service or reading not found. Please refresh and try again.`);
+        } else if (error.response.status === 403) {
+          setMessage('❌ You don\'t have permission to delete this reading.');
+        } else {
+          setMessage('Error deleting meter reading: ' + (error.response.data?.message || error.message));
+        }
+      } else if (error.message) {
+        setMessage('❌ Error deleting meter reading: ' + error.message);
       } else {
-        setMessage('Error deleting meter reading: ' + (error.response?.data?.message || error.message));
+        setMessage('❌ An unknown error occurred. Please try again.');
       }
     } finally {
       setLoading(false);
@@ -208,7 +262,7 @@ const ServiceDetails = ({ service, onBack, onUpdate, userRole = 'worker', curren
     const end = new Date(endDate);
     end.setHours(0, 0, 0, 0);
     const diffTime = Math.abs(end - start);
-    return Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
+    return Math.ceil(diffTime / (1000 * 60 * 60 * 24));
   };
 
   // Get campaign day number for a given date
@@ -431,6 +485,137 @@ const ServiceDetails = ({ service, onBack, onUpdate, userRole = 'worker', curren
     transition: 'all 0.3s ease'
   });
 
+  // Image Modal Component
+  const ImageModal = () => {
+    if (!imageModal.open) return null;
+
+    const modalOverlayStyle = {
+      position: 'fixed',
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      background: 'rgba(1, 81, 186, 0.85)',
+      zIndex: 2000,
+      backdropFilter: 'blur(3px)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: '20px'
+    };
+
+    const modalContentStyle = {
+      background: colors.white,
+      padding: isMobile ? '16px' : '24px',
+      borderRadius: '12px',
+      boxShadow: '0 25px 50px rgba(1, 81, 186, 0.3)',
+      maxWidth: '90vw',
+      maxHeight: '90vh',
+      width: isMobile ? '95%' : '600px',
+      border: `3px solid ${colors.secondary}`,
+      position: 'relative'
+    };
+
+    const imageContainerStyle = {
+      width: '100%',
+      height: isMobile ? '300px' : '450px',
+      background: colors.background,
+      borderRadius: '8px',
+      overflow: 'hidden',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      border: `2px solid ${colors.border}`
+    };
+
+    const imageStyle = {
+      maxWidth: '100%',
+      maxHeight: '100%',
+      objectFit: 'contain'
+    };
+
+    return (
+      <div style={modalOverlayStyle} onClick={closeImageModal}>
+        <div style={modalContentStyle} onClick={(e) => e.stopPropagation()}>
+          <div style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            marginBottom: '16px'
+          }}>
+            <h3 style={{
+              margin: 0,
+              color: colors.primary,
+              fontSize: isMobile ? '16px' : '18px',
+              fontWeight: '600'
+            }}>
+              {imageModal.imageType === 'start' ? '📸 Start Reading Photo' : '📸 End Reading Photo'} 
+              {imageModal.readingDay && ` - Day ${imageModal.readingDay}`}
+            </h3>
+            <button
+              onClick={closeImageModal}
+              style={{
+                background: 'rgba(239, 68, 68, 0.1)',
+                border: 'none',
+                color: colors.danger,
+                fontSize: '24px',
+                cursor: 'pointer',
+                padding: '4px',
+                borderRadius: '50%',
+                width: '36px',
+                height: '36px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                transition: 'all 0.2s ease',
+                fontWeight: 'bold'
+              }}
+              onMouseEnter={(e) => {
+                e.target.style.background = colors.danger;
+                e.target.style.color = colors.white;
+              }}
+              onMouseLeave={(e) => {
+                e.target.style.background = 'rgba(239, 68, 68, 0.1)';
+                e.target.style.color = colors.danger;
+              }}
+            >
+              ×
+            </button>
+          </div>
+
+          <div style={imageContainerStyle}>
+            <img
+              src={imageModal.imageUrl}
+              alt={imageModal.imageType === 'start' ? 'Start Reading' : 'End Reading'}
+              style={imageStyle}
+              onError={(e) => {
+                e.target.onerror = null;
+                e.target.src = 'https://via.placeholder.com/400x300?text=Image+Not+Available';
+              }}
+            />
+          </div>
+
+          <div style={{
+            marginTop: '16px',
+            paddingTop: '12px',
+            borderTop: `1px solid ${colors.border}`,
+            textAlign: 'center'
+          }}>
+            <button
+              onClick={closeImageModal}
+              style={{
+                ...buttonStyle(colors.primary, 'small'),
+                padding: '8px 24px'
+              }}
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   const renderServiceInfo = () => {
     if (!currentService) {
       return (
@@ -466,7 +651,6 @@ const ServiceDetails = ({ service, onBack, onUpdate, userRole = 'worker', curren
           }
         </p>
         
-        {/* Image Progress */}
         <div style={{ margin: '15px 0' }}>
           <div style={{ 
             display: 'flex', 
@@ -506,7 +690,6 @@ const ServiceDetails = ({ service, onBack, onUpdate, userRole = 'worker', curren
           </div>
         </div>
 
-        {/* Meter Readings Summary */}
         <div style={{ 
           display: 'grid', 
           gridTemplateColumns: isMobile ? '1fr 1fr' : 'repeat(2, 1fr)', 
@@ -538,14 +721,22 @@ const ServiceDetails = ({ service, onBack, onUpdate, userRole = 'worker', curren
     <div>
       {renderServiceInfo()}
 
-      {/* Add Reading Button */}
-      <div style={{ marginBottom: '20px', textAlign: 'center' }}>
+      {/* Add Reading Button - Top Left */}
+      <div style={{ 
+        display: 'flex', 
+        justifyContent: 'space-between', 
+        alignItems: 'center',
+        marginBottom: '16px'
+      }}>
         <button
           onClick={() => setShowAddReading(!showAddReading)}
           style={buttonStyle(colors.success)}
         >
           {showAddReading ? '✕ Cancel' : '➕ Add Daily Reading'}
         </button>
+        <div style={{ fontSize: '13px', color: colors.textLight }}>
+          {meterReadings.length} reading{meterReadings.length !== 1 ? 's' : ''}
+        </div>
       </div>
 
       {/* Add Reading Form */}
@@ -613,16 +804,16 @@ const ServiceDetails = ({ service, onBack, onUpdate, userRole = 'worker', curren
             </div>
           </div>
           
-          {/* Daily Proof Photo Input - OPTIONAL now */}
-          <div style={{ marginBottom: '16px' }}>
+          {/* Start Reading Photo - OPTIONAL */}
+          <div style={{ marginBottom: '12px' }}>
             <label style={{ display: 'block', marginBottom: '6px', fontWeight: '600', color: colors.primary }}>
-              📷 Meter Reading Proof Photo <span style={{ fontSize: '12px', color: colors.textLight }}>(Optional)</span>
+              📷 Start Reading Photo <span style={{ fontSize: '12px', color: colors.textLight }}>(Optional)</span>
             </label>
             <input
               type="file"
               accept="image/*"
               capture="environment"
-              onChange={(e) => setReadingImageFile(e.target.files[0])}
+              onChange={(e) => setStartReadingImage(e.target.files[0])}
               style={{
                 width: '100%',
                 padding: '10px',
@@ -632,13 +823,35 @@ const ServiceDetails = ({ service, onBack, onUpdate, userRole = 'worker', curren
                 boxSizing: 'border-box'
               }}
             />
-            {readingImageFile ? (
-              <div style={{ marginTop: '8px', fontSize: '13px', color: colors.success, fontWeight: '600' }}>
-                ✓ Selected: {readingImageFile.name} ({(readingImageFile.size / (1024 * 1024)).toFixed(2)} MB)
+            {startReadingImage && (
+              <div style={{ marginTop: '4px', fontSize: '12px', color: colors.success, fontWeight: '600' }}>
+                ✓ {startReadingImage.name}
               </div>
-            ) : (
-              <div style={{ marginTop: '8px', fontSize: '12px', color: colors.textLight, fontStyle: 'italic' }}>
-                No photo selected (optional)
+            )}
+          </div>
+
+          {/* End Reading Photo - OPTIONAL */}
+          <div style={{ marginBottom: '16px' }}>
+            <label style={{ display: 'block', marginBottom: '6px', fontWeight: '600', color: colors.primary }}>
+              📷 End Reading Photo <span style={{ fontSize: '12px', color: colors.textLight }}>(Optional)</span>
+            </label>
+            <input
+              type="file"
+              accept="image/*"
+              capture="environment"
+              onChange={(e) => setEndReadingImage(e.target.files[0])}
+              style={{
+                width: '100%',
+                padding: '10px',
+                border: `1px solid ${colors.border}`,
+                borderRadius: '8px',
+                background: colors.white,
+                boxSizing: 'border-box'
+              }}
+            />
+            {endReadingImage && (
+              <div style={{ marginTop: '4px', fontSize: '12px', color: colors.success, fontWeight: '600' }}>
+                ✓ {endReadingImage.name}
               </div>
             )}
           </div>
@@ -673,23 +886,24 @@ const ServiceDetails = ({ service, onBack, onUpdate, userRole = 'worker', curren
         </div>
       )}
 
-      {/* Meter Readings Table */}
-      {meterReadings.length > 0 ? (
-        <div style={tableContainerStyle}>
-          <table style={tableStyle}>
-            <thead>
-              <tr>
-                <th style={thStyle}>Day</th>
-                <th style={thStyle}>Date</th>
-                <th style={thStyle}>Start (km)</th>
-                <th style={thStyle}>End (km)</th>
-                <th style={thStyle}>Distance</th>
-                <th style={thStyle}>Proof Photo</th>
-                <th style={thStyle}>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {meterReadings.map((reading, index) => (
+      {/* Meter Readings Table - Always Visible */}
+      <div style={tableContainerStyle}>
+        <table style={tableStyle}>
+          <thead>
+            <tr>
+              <th style={thStyle}>Day</th>
+              <th style={thStyle}>Date</th>
+              <th style={thStyle}>Start (km)</th>
+              <th style={thStyle}>End (km)</th>
+              <th style={thStyle}>Distance</th>
+              <th style={thStyle}>Start Photo</th>
+              <th style={thStyle}>End Photo</th>
+              <th style={thStyle}>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {meterReadings.length > 0 ? (
+              meterReadings.map((reading, index) => (
                 <tr key={reading._id || index}>
                   <td style={tdStyle}>
                     <strong style={{ color: colors.primary, fontWeight: '600' }}>Day {reading.dayNumber || index + 1}</strong>
@@ -712,24 +926,45 @@ const ServiceDetails = ({ service, onBack, onUpdate, userRole = 'worker', curren
                     </span>
                   </td>
                   <td style={tdStyle}>
-                    {reading.image && reading.image.url ? (
-                      <a 
-                        href={reading.image.url} 
-                        target="_blank" 
-                        rel="noopener noreferrer"
+                    {reading.startImage && reading.startImage.url ? (
+                      <button
+                        onClick={() => openImageModal(reading.startImage.url, 'start', reading.dayNumber || index + 1)}
                         style={{
-                          display: 'inline-flex',
-                          alignItems: 'center',
-                          gap: '4px',
+                          background: 'none',
+                          border: 'none',
                           color: colors.primary,
                           fontWeight: '600',
-                          textDecoration: 'underline'
+                          textDecoration: 'underline',
+                          fontSize: '12px',
+                          cursor: 'pointer',
+                          padding: '4px 8px'
                         }}
                       >
-                        🖼️ View Photo
-                      </a>
+                        🖼️ View
+                      </button>
                     ) : (
-                      <span style={{ color: colors.textLight, fontSize: '12px' }}>No photo</span>
+                      <span style={{ color: colors.textLight, fontSize: '12px' }}>—</span>
+                    )}
+                  </td>
+                  <td style={tdStyle}>
+                    {reading.endImage && reading.endImage.url ? (
+                      <button
+                        onClick={() => openImageModal(reading.endImage.url, 'end', reading.dayNumber || index + 1)}
+                        style={{
+                          background: 'none',
+                          border: 'none',
+                          color: colors.primary,
+                          fontWeight: '600',
+                          textDecoration: 'underline',
+                          fontSize: '12px',
+                          cursor: 'pointer',
+                          padding: '4px 8px'
+                        }}
+                      >
+                        🖼️ View
+                      </button>
+                    ) : (
+                      <span style={{ color: colors.textLight, fontSize: '12px' }}>—</span>
                     )}
                   </td>
                   <td style={tdStyle}>
@@ -757,33 +992,29 @@ const ServiceDetails = ({ service, onBack, onUpdate, userRole = 'worker', curren
                     </div>
                   </td>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      ) : (
-        <div style={{ 
-          textAlign: 'center', 
-          padding: '40px', 
-          color: colors.textLight,
-          background: colors.background,
-          borderRadius: '8px',
-          border: `1px solid ${colors.border}`
-        }}>
-          <div style={{ fontSize: '48px', marginBottom: '16px' }}>📊</div>
-          <h4 style={{ color: colors.primary, marginBottom: '8px' }}>
-            No Meter Readings Yet
-          </h4>
-          <p style={{ margin: 0 }}>
-            Click "Add Daily Reading" to start tracking daily distance
-          </p>
-        </div>
-      )}
+              ))
+            ) : (
+              <tr>
+                <td colSpan="8" style={{ 
+                  textAlign: 'center', 
+                  padding: '30px', 
+                  color: colors.textLight 
+                }}>
+                  <div style={{ fontSize: '32px', marginBottom: '8px' }}>📊</div>
+                  No meter readings yet
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 
   return (
     <div style={containerStyle}>
+      <ImageModal />
+      
       <div style={headerStyle}>
         <div style={{flex: 1}}>
           <h2 style={{ 

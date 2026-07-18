@@ -198,56 +198,69 @@ const serviceSchema = new mongoose.Schema({
     serviceType: String
   }],
   
-  // METER READINGS - Image is OPTIONAL
-  meterReadings: [{
-    date: {
-      type: Date,
-      required: true,
-      default: Date.now
-    },
-    dayNumber: {
-      type: Number,
-      required: true,
-      min: 1
-    },
-    startReading: {
-      type: Number,
-      required: true,
-      min: 0
-    },
-    endReading: {
-      type: Number,
-      required: true,
-      min: 0
-    },
-    unit: {
+ // METER READINGS - With start and end images
+meterReadings: [{
+  date: {
+    type: Date,
+    required: true,
+    default: Date.now
+  },
+  dayNumber: {
+    type: Number,
+    required: true,
+    min: 1
+  },
+  startReading: {
+    type: Number,
+    required: true,
+    min: 0
+  },
+  endReading: {
+    type: Number,
+    required: true,
+    min: 0
+  },
+  unit: {
+    type: String,
+    default: 'km'
+  },
+  location: {
+    type: {
       type: String,
-      default: 'km'
+      enum: ['automatic', 'manual'],
+      default: 'automatic'
     },
-    location: {
-      type: {
-        type: String,
-        enum: ['automatic', 'manual'],
-        default: 'automatic'
-      },
-      coordinates: {
-        lat: Number,
-        lng: Number
-      },
-      address: String
+    coordinates: {
+      lat: Number,
+      lng: Number
     },
-    recordedBy: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
-      required: true
-    },
-    // Image is now OPTIONAL - not required
-    image: {
-      url: String,
-      public_id: String
-    }
-  }],
-  
+    address: String
+  },
+  recordedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  // Start reading image
+  startImage: {
+    url: String,
+    public_id: String
+  },
+  // End reading image
+  endImage: {
+    url: String,
+    public_id: String
+  },
+  // Keep for backward compatibility
+  image: {
+    url: String,
+    public_id: String
+  },
+  images: [{
+    url: String,
+    public_id: String
+  }]
+}],
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',

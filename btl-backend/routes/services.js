@@ -1205,8 +1205,11 @@ router.get('/:id/images', auth, async (req, res) => {
   }
 });
 
-// ========== METER READINGS - ADD (IMAGE OPTIONAL) ==========
-router.post('/:id/meter-readings', auth, upload.single('image'), async (req, res) => {
+// ========== METER READINGS - ADD (WITH START AND END IMAGES) ==========
+router.post('/:id/meter-readings', auth, upload.fields([
+  { name: 'startImage', maxCount: 1 },
+  { name: 'endImage', maxCount: 1 }
+]), async (req, res) => {
   try {
     const { startReading, endReading } = req.body;
 
@@ -1215,7 +1218,7 @@ router.post('/:id/meter-readings', auth, upload.single('image'), async (req, res
     console.log('User:', req.user.username);
     console.log('Role:', req.user.role);
     console.log('Readings:', { startReading, endReading });
-    console.log('Has file:', !!req.file);
+    console.log('Files:', req.files);
 
     // Validate readings
     if (!startReading || !endReading) {
@@ -1233,15 +1236,6 @@ router.post('/:id/meter-readings', auth, upload.single('image'), async (req, res
         message: 'End reading must be greater than start reading'
       });
     }
-
-    // IMAGE IS NOW OPTIONAL - removed the check that required an image
-    // if (!req.file) {
-    //   console.log('❌ No photo provided');
-    //   return res.status(400).json({
-    //     success: false,
-    //     message: 'A proof photo of the meter reading is required'
-    //   });
-    // }
 
     // Find the service
     console.log('🔍 Finding service:', req.params.id);
@@ -1284,31 +1278,48 @@ router.post('/:id/meter-readings', auth, upload.single('image'), async (req, res
       recordedBy: req.user._id
     };
 
-    // Upload meter reading photo to Cloudinary ONLY if file is provided
-    if (req.file) {
-      console.log('☁️ Uploading meter reading photo to Cloudinary...');
+    // Upload start reading image if provided
+    if (req.files && req.files.startImage && req.files.startImage.length > 0) {
       try {
-        const fileStr = req.file.buffer.toString('base64');
-        const dataURI = `data:${req.file.mimetype};base64,${fileStr}`;
+        const file = req.files.startImage[0];
+        const fileStr = file.buffer.toString('base64');
+        const dataURI = `data:${file.mimetype};base64,${fileStr}`;
         
         const uploadResult = await cloudinary.uploader.upload(dataURI, {
-          folder: 'btl_meter_readings',
+          folder: 'btl_meter_readings/start',
           resource_type: 'image'
         });
         
-        console.log('✅ Cloudinary upload successful:', uploadResult.secure_url);
-        
-        // Add image to meter reading
-        meterReading.image = {
+        console.log('✅ Start image uploaded:', uploadResult.secure_url);
+        meterReading.startImage = {
           url: uploadResult.secure_url,
           public_id: uploadResult.public_id
         };
       } catch (uploadError) {
-        console.error('⚠️ Cloudinary upload failed (continuing without image):', uploadError.message);
-        // Continue without image if upload fails
+        console.error('⚠️ Start image upload failed:', uploadError.message);
       }
-    } else {
-      console.log('ℹ️ No image provided, meter reading saved without photo');
+    }
+
+    // Upload end reading image if provided
+    if (req.files && req.files.endImage && req.files.endImage.length > 0) {
+      try {
+        const file = req.files.endImage[0];
+        const fileStr = file.buffer.toString('base64');
+        const dataURI = `data:${file.mimetype};base64,${fileStr}`;
+        
+        const uploadResult = await cloudinary.uploader.upload(dataURI, {
+          folder: 'btl_meter_readings/end',
+          resource_type: 'image'
+        });
+        
+        console.log('✅ End image uploaded:', uploadResult.secure_url);
+        meterReading.endImage = {
+          url: uploadResult.secure_url,
+          public_id: uploadResult.public_id
+        };
+      } catch (uploadError) {
+        console.error('⚠️ End image upload failed:', uploadError.message);
+      }
     }
 
     console.log('📊 Adding meter reading:', meterReading);
@@ -1330,7 +1341,7 @@ router.post('/:id/meter-readings', auth, upload.single('image'), async (req, res
 
     res.json({
       success: true,
-      message: req.file ? 'Meter reading added successfully with photo' : 'Meter reading added successfully (without photo)',
+      message: 'Meter reading added successfully',
       meterReading,
       service
     });
