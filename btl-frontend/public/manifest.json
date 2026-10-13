@@ -1,0 +1,26 @@
+{
+  "short_name": "BTL Manager",
+  "name": "BTL Manager Dashboard",
+  "description": "Business Team Leader Management System",
+  "icons": [
+    {
+      "src": "/logo192.png",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/logo512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any maskable"
+    }
+  ],
+  "start_url": "https://btlmanager.in/",
+  "display": "standalone",
+  "theme_color": "#667eea",
+  "background_color": "#764ba2",
+  "scope": "https://btlmanager.in/",
+  "orientation": "any",
+  "categories": ["business", "productivity", "utilities"]
+}
