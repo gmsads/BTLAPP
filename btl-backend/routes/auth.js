@@ -51,8 +51,9 @@ router.post('/register', async (req, res) => {
     }
 
     // Validate mobile number format
+    const cleanContactNumber = contactNumber.toString().trim().replace(/[\s-]/g, '');
     const mobileRegex = /^[0-9]{10,15}$/;
-    if (!mobileRegex.test(contactNumber)) {
+    if (!mobileRegex.test(cleanContactNumber)) {
       return res.status(400).json({ 
         success: false, 
         message: 'Please enter a valid mobile number (10-15 digits)' 
@@ -83,36 +84,49 @@ router.post('/register', async (req, res) => {
       });
     }
 
-    // Check if mobile number or username already exists
-    const existingUser = await User.findOne({ 
-      $or: [{ contactNumber }, { username }] 
-    });
-
-    if (existingUser) {
+    // Check if contact number already exists
+    const existingContact = await User.findOne({ contactNumber: cleanContactNumber });
+    if (existingContact) {
       return res.status(400).json({
         success: false,
-        message: 'User already exists with this mobile number or username'
+        message: 'User with this contact number already exists'
+      });
+    }
+
+    // Check if username already exists
+    const existingUsername = await User.findOne({ username: username.trim() });
+    if (existingUsername) {
+      return res.status(400).json({
+        success: false,
+        message: 'Username is already taken'
       });
     }
 
     // Create user data object
     const userData = { 
-      username, 
-      contactNumber, 
+      username: username.trim(), 
+      contactNumber: cleanContactNumber, 
       password, 
       role
     };
 
-    // Add optional email if provided
-    if (email) {
+    // Add optional email if provided and non-empty
+    if (email && typeof email === 'string' && email.trim()) {
       const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!emailRegex.test(email)) {
+      if (!emailRegex.test(email.trim())) {
         return res.status(400).json({ 
           success: false, 
           message: 'Please enter a valid email address' 
         });
       }
-      userData.email = email;
+      const existingEmail = await User.findOne({ email: email.trim().toLowerCase() });
+      if (existingEmail) {
+        return res.status(400).json({
+          success: false,
+          message: 'User with this email already exists'
+        });
+      }
+      userData.email = email.trim().toLowerCase();
     }
 
     // Add business name for clients
@@ -166,9 +180,27 @@ router.post('/register', async (req, res) => {
 
     // Handle duplicate key error
     if (error.code === 11000) {
+      if (error.keyPattern?.contactNumber || error.message?.includes('contactNumber')) {
+        return res.status(400).json({
+          success: false,
+          message: 'User with this contact number already exists'
+        });
+      }
+      if (error.keyPattern?.username || error.message?.includes('username')) {
+        return res.status(400).json({
+          success: false,
+          message: 'Username is already taken'
+        });
+      }
+      if ((error.keyPattern?.email || error.message?.includes('email')) && req.body.email && req.body.email.toString().trim()) {
+        return res.status(400).json({
+          success: false,
+          message: 'User with this email already exists'
+        });
+      }
       return res.status(400).json({
         success: false,
-        message: 'Mobile number or username already exists'
+        message: 'User with this contact number already exists'
       });
     }
 

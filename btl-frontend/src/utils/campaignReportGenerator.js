@@ -227,9 +227,10 @@ export const generateCampaignAuditPDF = async (servicesList, businessName) => {
       drawHeader(`${serviceTitle.toUpperCase()} Campaign`);
 
       // Service summary card
+      const descText = service.description || service.notes || '-';
       pdf.setFillColor(248, 250, 252);
       pdf.setDrawColor(226, 232, 240);
-      pdf.rect(margin, yPosition, contentWidth, 30, 'FD');
+      pdf.rect(margin, yPosition, contentWidth, 36, 'FD');
       
       pdf.setFontSize(11);
       pdf.setFont('helvetica', 'bold');
@@ -241,13 +242,14 @@ export const generateCampaignAuditPDF = async (servicesList, businessName) => {
       pdf.setTextColor(80, 80, 80);
       const dateStr = service.startDate ? `${new Date(service.startDate).toLocaleDateString()} - ${new Date(service.endDate || service.deliveryDate).toLocaleDateString()}` : 'N/A';
       pdf.text(`Duration: ${dateStr}`, margin + 5, yPosition + 13);
-      pdf.text(`Target Quantity: ${service.quantity || 0}`, margin + 5, yPosition + 19);
-      pdf.text(`Status: ${(service.status || 'pending').toUpperCase()}`, margin + 5, yPosition + 25);
+      pdf.text(`Requirement: ${serviceTitle.toUpperCase()} (${service.quantity || 0} units)`, margin + 5, yPosition + 19);
+      pdf.text(`Description: ${String(descText).substring(0, 90)}`, margin + 5, yPosition + 25);
+      pdf.text(`Status: ${(service.status || 'pending').toUpperCase()}`, margin + 5, yPosition + 31);
       
       if (service.location?.address) {
         pdf.text(`Location: ${service.location.address.substring(0, 50)}...`, pageWidth / 2, yPosition + 13);
       }
-      yPosition += 38;
+      yPosition += 44;
 
       // Group images and meter readings
       const hasCampaign = service.startDate && (service.endDate || service.deliveryDate);

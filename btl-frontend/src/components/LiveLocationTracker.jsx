@@ -19,6 +19,14 @@ const LiveLocationTracker = ({ user }) => {
   // Send coordinates to backend
   const sendLocationUpdate = useCallback(async (position, source = 'auto_30min') => {
     if (isSyncingRef.current) return;
+
+    // Throttle: only send update if at least 30 minutes have elapsed since last ping, unless manual_sync
+    const lastPing = parseInt(localStorage.getItem(STORAGE_KEY_LAST_PING) || '0', 10);
+    const elapsed = Date.now() - lastPing;
+    if (lastPing > 0 && elapsed < TRACKING_INTERVAL_MS && source !== 'manual_sync' && source !== 'permission_granted') {
+      return;
+    }
+
     isSyncingRef.current = true;
     setIsSyncing(true);
 
@@ -124,11 +132,18 @@ const LiveLocationTracker = ({ user }) => {
     const checkPermissionAndInit = async () => {
       const previouslyGranted = localStorage.getItem(STORAGE_KEY_PERMISSION) === 'true';
 
+      const lastPing = parseInt(localStorage.getItem(STORAGE_KEY_LAST_PING) || '0', 10);
+      const shouldSyncNow = !lastPing || (Date.now() - lastPing) >= TRACKING_INTERVAL_MS;
+
       if (navigator.permissions && navigator.permissions.query) {
         try {
           const status = await navigator.permissions.query({ name: 'geolocation' });
           if (status.state === 'granted') {
-            captureAndSync('app_start');
+            if (shouldSyncNow) {
+              captureAndSync('app_start');
+            } else {
+              setTrackingStatus('active');
+            }
           } else if (status.state === 'prompt') {
             if (previouslyGranted) {
               requestPermissionAndStart();
@@ -149,7 +164,11 @@ const LiveLocationTracker = ({ user }) => {
         } catch {
           // Fallback if query throws
           if (previouslyGranted) {
-            captureAndSync('app_start');
+            if (shouldSyncNow) {
+              captureAndSync('app_start');
+            } else {
+              setTrackingStatus('active');
+            }
           } else {
             setTrackingStatus('requesting');
           }
@@ -157,7 +176,11 @@ const LiveLocationTracker = ({ user }) => {
       } else {
         // Browser doesn't support permissions.query
         if (previouslyGranted) {
-          captureAndSync('app_start');
+          if (shouldSyncNow) {
+            captureAndSync('app_start');
+          } else {
+            setTrackingStatus('active');
+          }
         } else {
           setTrackingStatus('requesting');
         }

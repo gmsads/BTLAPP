@@ -88,8 +88,52 @@ const serviceSchema = new mongoose.Schema({
     },
     images: [{
       url: String,
+      public_id: String,
       caption: String,
-      uploadedAt: { type: Date, default: Date.now }
+      takenAt: { type: Date, default: Date.now },
+      uploadedAt: { type: Date, default: Date.now },
+      source: {
+        type: String,
+        enum: ['camera', 'gallery', 'folder', 'upload'],
+        default: 'gallery'
+      },
+      latitude: {
+        type: Number,
+        default: null
+      },
+      longitude: {
+        type: Number,
+        default: null
+      },
+      locationAddress: {
+        type: String,
+        default: ''
+      },
+      simpleAddress: {
+        type: String,
+        default: ''
+      },
+      location: {
+        lat: Number,
+        lng: Number,
+        address: String
+      },
+      itemId: {
+        type: mongoose.Schema.Types.ObjectId,
+        default: null
+      },
+      serviceIndex: {
+        type: Number,
+        default: null
+      },
+      serviceType: {
+        type: String,
+        default: null
+      },
+      dayNumber: {
+        type: Number,
+        default: 1
+      }
     }]
   }],
   
@@ -407,5 +451,14 @@ serviceSchema.statics.findAssignedToWorker = function(workerId) {
     .populate('assignedTo', 'username email contactNumber')
     .populate('services.assignedTo', 'username email contactNumber');
 };
+
+// Indexes for high-concurrency query performance
+serviceSchema.index({ assignedTo: 1, createdAt: -1 });
+serviceSchema.index({ 'services.assignedTo': 1, createdAt: -1 });
+serviceSchema.index({ createdBy: 1, createdAt: -1 });
+serviceSchema.index({ status: 1, createdAt: -1 });
+serviceSchema.index({ clientId: 1, createdAt: -1 });
+serviceSchema.index({ businessName: 1 });
+serviceSchema.index({ createdAt: -1 });
 
 module.exports = mongoose.model('Service', serviceSchema);

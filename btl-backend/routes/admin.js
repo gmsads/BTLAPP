@@ -4,6 +4,9 @@ const Service = require('../models/Service');
 
 const router = express.Router();
 
+const adminAuthCache = new Map();
+const ADMIN_AUTH_TTL_MS = 15000;
+
 // Admin auth middleware (keep this as is)
 const adminAuth = async (req, res, next) => {
   try {
@@ -20,7 +23,19 @@ const adminAuth = async (req, res, next) => {
     const User = require('../models/User');
     
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.userId).select('-password');
+    const cacheKey = String(decoded.userId);
+    const cached = adminAuthCache.get(cacheKey);
+    let user = null;
+
+    if (cached && Date.now() - cached.ts < ADMIN_AUTH_TTL_MS) {
+      user = cached.user;
+    } else {
+      user = await User.findById(decoded.userId).select('-password');
+      if (user) {
+        if (adminAuthCache.size > 200) adminAuthCache.clear();
+        adminAuthCache.set(cacheKey, { user, ts: Date.now() });
+      }
+    }
     
     if (!user) {
       return res.status(401).json({ 
@@ -55,7 +70,7 @@ router.get('/available-workers', adminAuth, async (req, res) => {
     const workers = await User.find({ 
       role: 'user',
       isActive: true 
-    }).select('username email contactNumber');
+    }).select('username email contactNumber').lean();
 
     console.log(`Found ${workers.length} available workers`);
 
@@ -76,7 +91,7 @@ router.get('/available-workers', adminAuth, async (req, res) => {
 // Get all users (for admin)
 router.get('/users', adminAuth, async (req, res) => {
   try {
-    const users = await User.find().select('-password').sort({ createdAt: -1 });
+    const users = await User.find().select('-password').sort({ createdAt: -1 }).lean();
     
     res.json({
       success: true,
@@ -104,6 +119,22 @@ router.post('/users', adminAuth, async (req, res) => {
       });
     }
 
+    if (!contactNumber || !contactNumber.toString().trim()) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Contact number is required' 
+      });
+    }
+
+    const cleanContactNumber = contactNumber.toString().trim().replace(/[\s-]/g, '');
+    const mobileRegex = /^[0-9]{10,15}$/;
+    if (!mobileRegex.test(cleanContactNumber)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Please enter a valid mobile number (10-15 digits)' 
+      });
+    }
+
     if (password.length < 6) {
       return res.status(400).json({ 
         success: false, 
@@ -127,36 +158,53 @@ router.post('/users', adminAuth, async (req, res) => {
       });
     }
 
-    // Check if user exists
-    const searchConditions = [{ username }];
-    if (email && email.trim()) {
-      searchConditions.push({ email: email.trim().toLowerCase() });
-    }
-    const existingUser = await User.findOne({ 
-      $or: searchConditions 
-    });
-
-    if (existingUser) {
+    // Check if contact number already exists
+    const existingContact = await User.findOne({ contactNumber: cleanContactNumber });
+    if (existingContact) {
       return res.status(400).json({
         success: false,
-        message: 'User already exists with this email or username'
+        message: 'User with this contact number already exists'
       });
+    }
+
+    // Check if username already exists
+    const existingUsername = await User.findOne({ username: username.trim() });
+    if (existingUsername) {
+      return res.status(400).json({
+        success: false,
+        message: 'Username is already taken'
+      });
+    }
+
+    // Check if email already exists (only if email is provided and non-empty)
+    if (email && typeof email === 'string' && email.trim()) {
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(email.trim())) {
+        return res.status(400).json({
+          success: false,
+          message: 'Please enter a valid email address'
+        });
+      }
+      const existingEmail = await User.findOne({ email: email.trim().toLowerCase() });
+      if (existingEmail) {
+        return res.status(400).json({
+          success: false,
+          message: 'User with this email already exists'
+        });
+      }
     }
 
     // Create user data object
     const userData = { 
-      username, 
+      username: username.trim(), 
+      contactNumber: cleanContactNumber,
       password, 
       role
     };
 
-    if (email && email.trim()) {
+    // Email is strictly optional - only set if provided and non-empty
+    if (email && typeof email === 'string' && email.trim()) {
       userData.email = email.trim().toLowerCase();
-    }
-
-    // Add optional fields if provided
-    if (contactNumber) {
-      userData.contactNumber = contactNumber;
     }
 
     if (role === 'client') {
@@ -179,7 +227,7 @@ router.post('/users', adminAuth, async (req, res) => {
       user: {
         id: user._id,
         username: user.username,
-        email: user.email,
+        email: user.email || '',
         contactNumber: user.contactNumber || '',
         role: user.role,
         businessName: user.businessName,
@@ -191,6 +239,26 @@ router.post('/users', adminAuth, async (req, res) => {
 
   } catch (error) {
     console.error('Create user error:', error);
+    if (error.code === 11000) {
+      if (error.keyPattern?.contactNumber || error.message?.includes('contactNumber')) {
+        return res.status(400).json({
+          success: false,
+          message: 'User with this contact number already exists'
+        });
+      }
+      if (error.keyPattern?.username || error.message?.includes('username')) {
+        return res.status(400).json({
+          success: false,
+          message: 'Username is already taken'
+        });
+      }
+      if ((error.keyPattern?.email || error.message?.includes('email')) && req.body.email && req.body.email.toString().trim()) {
+        return res.status(400).json({
+          success: false,
+          message: 'User with this email already exists'
+        });
+      }
+    }
     res.status(500).json({
       success: false,
       message: 'Error creating user: ' + error.message
@@ -211,34 +279,65 @@ router.put('/users/:id', adminAuth, async (req, res) => {
       });
     }
 
-    // Check if email or username already exists (excluding current user)
-    const searchConditions = [{ username }];
-    if (email && email.trim()) {
-      searchConditions.push({ email: email.trim().toLowerCase() });
-    }
+    // Check if username already exists (excluding current user)
     const existingUser = await User.findOne({
-      $and: [
-        { _id: { $ne: req.params.id } },
-        { $or: searchConditions }
-      ]
+      _id: { $ne: req.params.id },
+      username: username.trim()
     });
 
     if (existingUser) {
       return res.status(400).json({
         success: false,
-        message: 'Username or email already exists'
+        message: 'Username is already taken'
       });
     }
 
     // Prepare update data
     const updateData = { 
-      username, 
-      role,
-      contactNumber: contactNumber || '' // Set to empty string if not provided
+      username: username.trim(), 
+      role
     };
 
+    // Check if contactNumber already exists (excluding current user)
+    if (contactNumber && contactNumber.toString().trim()) {
+      const cleanContactNumber = contactNumber.toString().trim().replace(/[\s-]/g, '');
+      const mobileRegex = /^[0-9]{10,15}$/;
+      if (!mobileRegex.test(cleanContactNumber)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Please enter a valid mobile number (10-15 digits)'
+        });
+      }
+      const existingContact = await User.findOne({
+        _id: { $ne: req.params.id },
+        contactNumber: cleanContactNumber
+      });
+      if (existingContact) {
+        return res.status(400).json({
+          success: false,
+          message: 'User with this contact number already exists'
+        });
+      }
+      updateData.contactNumber = cleanContactNumber;
+    }
+
     if (email !== undefined) {
-      updateData.email = email && email.trim() ? email.trim().toLowerCase() : null;
+      if (email && typeof email === 'string' && email.trim()) {
+        const cleanEmail = email.trim().toLowerCase();
+        const existingEmail = await User.findOne({
+          _id: { $ne: req.params.id },
+          email: cleanEmail
+        });
+        if (existingEmail) {
+          return res.status(400).json({
+            success: false,
+            message: 'User with this email already exists'
+          });
+        }
+        updateData.email = cleanEmail;
+      } else {
+        updateData.$unset = { email: 1 };
+      }
     }
     
     // Only include businessName if role is client
@@ -290,6 +389,26 @@ router.put('/users/:id', adminAuth, async (req, res) => {
 
   } catch (error) {
     console.error('Update user error:', error);
+    if (error.code === 11000) {
+      if (error.keyPattern?.contactNumber || error.message?.includes('contactNumber')) {
+        return res.status(400).json({
+          success: false,
+          message: 'User with this contact number already exists'
+        });
+      }
+      if (error.keyPattern?.username || error.message?.includes('username')) {
+        return res.status(400).json({
+          success: false,
+          message: 'Username is already taken'
+        });
+      }
+      if ((error.keyPattern?.email || error.message?.includes('email')) && req.body.email && req.body.email.toString().trim()) {
+        return res.status(400).json({
+          success: false,
+          message: 'User with this email already exists'
+        });
+      }
+    }
     res.status(500).json({
       success: false,
       message: 'Error updating user: ' + error.message
@@ -314,7 +433,8 @@ router.get('/services', adminAuth, async (req, res) => {
       .populate('createdBy', 'username email role contactNumber')
       .populate('assignedTo', 'username email contactNumber')
       .populate('services.assignedTo', 'username email contactNumber')
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .lean();
 
     res.json({
       success: true,
@@ -332,51 +452,70 @@ router.get('/services', adminAuth, async (req, res) => {
 // Get dashboard statistics
 router.get('/stats', adminAuth, async (req, res) => {
   try {
-    const totalUsers = await User.countDocuments();
-    const totalAdmins = await User.countDocuments({ role: 'admin' });
-    const totalWorkers = await User.countDocuments({ role: 'user' });
-    const totalServices = await Service.countDocuments();
-    
-    const servicesByStatus = await Service.aggregate([
-      {
-        $group: {
-          _id: '$status',
-          count: { $sum: 1 }
+    const [
+      totalUsers,
+      totalAdmins,
+      totalWorkers,
+      totalServices,
+      servicesByStatus,
+      servicesByUser,
+      assignedServices,
+      unassignedServices
+    ] = await Promise.all([
+      User.countDocuments(),
+      User.countDocuments({ role: 'admin' }),
+      User.countDocuments({ role: 'user' }),
+      Service.countDocuments(),
+      Service.aggregate([
+        {
+          $group: {
+            _id: '$status',
+            count: { $sum: 1 }
+          }
         }
-      }
+      ]),
+      Service.aggregate([
+        {
+          $group: {
+            _id: '$createdBy',
+            count: { $sum: 1 }
+          }
+        },
+        {
+          $lookup: {
+            from: 'users',
+            localField: '_id',
+            foreignField: '_id',
+            as: 'user'
+          }
+        },
+        {
+          $unwind: '$user'
+        },
+        {
+          $project: {
+            username: '$user.username',
+            email: '$user.email',
+            contactNumber: '$user.contactNumber',
+            count: 1
+          }
+        },
+        { $sort: { count: -1 } }
+      ]),
+      Service.countDocuments({
+        $or: [
+          { assignedTo: { $ne: null } },
+          { 'services.assignedTo': { $ne: null } }
+        ]
+      }),
+      Service.countDocuments({
+        assignedTo: null,
+        $or: [
+          { services: { $size: 0 } },
+          { services: { $not: { $elemMatch: { assignedTo: { $ne: null } } } } }
+        ]
+      })
     ]);
-
-    const servicesByUser = await Service.aggregate([
-      {
-        $group: {
-          _id: '$createdBy',
-          count: { $sum: 1 }
-        }
-      },
-      {
-        $lookup: {
-          from: 'users',
-          localField: '_id',
-          foreignField: '_id',
-          as: 'user'
-        }
-      },
-      {
-        $unwind: '$user'
-      },
-      {
-        $project: {
-          username: '$user.username',
-          email: '$user.email',
-          contactNumber: '$user.contactNumber',
-          count: 1
-        }
-      },
-      { $sort: { count: -1 } }
-    ]);
-
-    const assignedServices = await Service.countDocuments({ assignedTo: { $ne: null } });
-    const unassignedServices = await Service.countDocuments({ assignedTo: null });
 
     res.json({
       success: true,

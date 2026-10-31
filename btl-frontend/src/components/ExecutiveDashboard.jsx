@@ -79,8 +79,8 @@ const WorkerDashboard = ({ user, onLogout }) => {
             ))
           ].filter((img, i, arr) => arr.findIndex(t => (t.public_id && t.public_id === img.public_id) || (t.url && t.url === img.url) || ((t._id || t.id) && (img._id || img.id) && (t._id || t.id).toString() === (img._id || img.id).toString())) === i);
 
-          const itemAssignedTo = serviceItem.assignedTo || service.assignedTo;
-          const isAssignedToMe = (serviceItem.assignedTo?._id || serviceItem.assignedTo)?.toString() === currentUserId || (!serviceItem.assignedTo && (service.assignedTo?._id || service.assignedTo)?.toString() === currentUserId);
+          const itemAssignedTo = serviceItem.assignedTo || (service.assignedTo && !service.services.some(s => s.assignedTo) ? service.assignedTo : null);
+          const isAssignedToMe = (itemAssignedTo?._id || itemAssignedTo)?.toString() === currentUserId;
 
           if (isAssignedToMe) {
             expanded.push({
@@ -102,7 +102,7 @@ const WorkerDashboard = ({ user, onLogout }) => {
           }
         });
       } else {
-        const isAssignedToMe = !service.assignedTo || (service.assignedTo?._id || service.assignedTo)?.toString() === currentUserId;
+        const isAssignedToMe = (service.assignedTo?._id || service.assignedTo)?.toString() === currentUserId;
         if (isAssignedToMe) {
           expanded.push({
             ...service,

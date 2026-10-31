@@ -29,6 +29,7 @@ const userSchema = new mongoose.Schema({
     trim: true,
     lowercase: true,
     sparse: true,
+    set: v => (v && typeof v === 'string' && v.trim() ? v.trim().toLowerCase() : undefined),
     validate: {
       validator: function(v) {
         if (!v) return true; // Email is optional
@@ -145,5 +146,6 @@ userSchema.index({ username: 1 });
 userSchema.index({ role: 1 });
 userSchema.index({ isActive: 1 });
 userSchema.index({ subscriptionStatus: 1 });
+userSchema.index({ createdBy: 1, role: 1, isActive: 1 });
 
 module.exports = mongoose.model('User', userSchema);

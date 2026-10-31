@@ -2964,7 +2964,11 @@ const AddUserForm = ({ onUserAdded, isMobile, colors, buttonStyle }) => {
     setMessage('');
 
     try {
-      const response = await axios.post('/owner/users', formData);
+      const payload = {
+        ...formData,
+        email: formData.email && formData.email.trim() ? formData.email.trim() : undefined
+      };
+      const response = await axios.post('/owner/users', payload);
       if (response.data.success) {
         setMessage('User created successfully!');
         setFormData({ 
@@ -2979,7 +2983,7 @@ const AddUserForm = ({ onUserAdded, isMobile, colors, buttonStyle }) => {
         onUserAdded();
       }
     } catch (error) {
-      setMessage('Error creating user: ' + (error.response?.data?.message || error.message));
+      setMessage(error.response?.data?.message || ('Error creating user: ' + error.message));
     } finally {
       setLoading(false);
     }
@@ -3077,9 +3081,11 @@ const AddUserForm = ({ onUserAdded, isMobile, colors, buttonStyle }) => {
         <input
           type="tel"
           name="contactNumber"
-          placeholder="Contact Number (e.g., +1234567890)"
+          placeholder="Contact Number (10-15 digits)"
           value={formData.contactNumber}
           onChange={handleChange}
+          required
+          pattern="[0-9]{10,15}"
           style={inputStyle}
         />
         <select
@@ -3151,7 +3157,11 @@ const EditUserForm = ({ user, onUserUpdated, isMobile, colors, buttonStyle }) =>
     setMessage('');
 
     try {
-      const response = await axios.put(`/owner/users/${user._id}`, formData);
+      const payload = {
+        ...formData,
+        email: formData.email && formData.email.trim() ? formData.email.trim() : undefined
+      };
+      const response = await axios.put(`/owner/users/${user._id}`, payload);
       if (response.data.success) {
         setMessage('User updated successfully!');
         setShowForm(false);
@@ -3265,9 +3275,11 @@ const EditUserForm = ({ user, onUserUpdated, isMobile, colors, buttonStyle }) =>
           <input
             type="tel"
             name="contactNumber"
-            placeholder="Contact Number (e.g., +1234567890)"
+            placeholder="Contact Number (10-15 digits)"
             value={formData.contactNumber}
             onChange={handleChange}
+            required
+            pattern="[0-9]{10,15}"
             style={inputStyle}
           />
           <select

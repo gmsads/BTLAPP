@@ -5,6 +5,9 @@ const User = require('../models/User');
 const Service = require('../models/Service');
 const mongoose = require('mongoose');
 
+const ownerAuthCache = new Map();
+const OWNER_AUTH_TTL_MS = 15000;
+
 // Owner auth middleware
 const ownerAuth = async (req, res, next) => {
   try {
@@ -19,7 +22,19 @@ const ownerAuth = async (req, res, next) => {
 
     const jwt = require('jsonwebtoken');
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.userId).select('-password');
+    const cacheKey = String(decoded.userId);
+    const cached = ownerAuthCache.get(cacheKey);
+    let user = null;
+
+    if (cached && Date.now() - cached.ts < OWNER_AUTH_TTL_MS) {
+      user = cached.user;
+    } else {
+      user = await User.findById(decoded.userId).select('-password');
+      if (user) {
+        if (ownerAuthCache.size > 200) ownerAuthCache.clear();
+        ownerAuthCache.set(cacheKey, { user, ts: Date.now() });
+      }
+    }
     
     if (!user) {
       return res.status(401).json({ 
@@ -51,52 +66,50 @@ router.use(ownerAuth);
 // 1. Get owner dashboard statistics (ONLY owner's data)
 router.get('/stats', async (req, res) => {
   try {
-    // Get users created by this owner
-    const totalUsers = await User.countDocuments({ 
-      createdBy: req.user._id,
-      role: { $in: ['user', 'client'] } 
-    });
-    
-    // Get workers created by this owner
-    const totalWorkers = await User.countDocuments({ 
-      createdBy: req.user._id,
-      role: 'user' 
-    });
-    
-    // Get clients created by this owner
-    const totalClients = await User.countDocuments({ 
-      createdBy: req.user._id,
-      role: 'client' 
-    });
-    
-    // Get services created by this owner
-    const totalServices = await Service.countDocuments({ 
-      createdBy: req.user._id 
-    });
-    
-    // Get services by status (owner's services only)
-    const servicesByStatus = await Service.aggregate([
-      {
-        $match: { createdBy: req.user._id }
-      },
-      {
-        $group: {
-          _id: '$status',
-          count: { $sum: 1 }
-        }
-      }
+    const [
+      totalUsers,
+      totalWorkers,
+      totalClients,
+      totalServices,
+      servicesByStatus,
+      assignedServices,
+      unassignedServices
+    ] = await Promise.all([
+      User.countDocuments({
+        createdBy: req.user._id,
+        role: { $in: ['user', 'client'] }
+      }),
+      User.countDocuments({
+        createdBy: req.user._id,
+        role: 'user'
+      }),
+      User.countDocuments({
+        createdBy: req.user._id,
+        role: 'client'
+      }),
+      Service.countDocuments({
+        createdBy: req.user._id
+      }),
+      Service.aggregate([
+        { $match: { createdBy: req.user._id } },
+        { $group: { _id: '$status', count: { $sum: 1 } } }
+      ]),
+      Service.countDocuments({
+        createdBy: req.user._id,
+        $or: [
+          { assignedTo: { $ne: null } },
+          { 'services.assignedTo': { $ne: null } }
+        ]
+      }),
+      Service.countDocuments({
+        createdBy: req.user._id,
+        assignedTo: null,
+        $or: [
+          { services: { $size: 0 } },
+          { services: { $not: { $elemMatch: { assignedTo: { $ne: null } } } } }
+        ]
+      })
     ]);
-
-    // Get assigned vs unassigned services (owner's services only)
-    const assignedServices = await Service.countDocuments({ 
-      createdBy: req.user._id,
-      assignedTo: { $ne: null } 
-    });
-    
-    const unassignedServices = await Service.countDocuments({ 
-      createdBy: req.user._id,
-      assignedTo: null 
-    });
 
     res.json({
       success: true,
@@ -125,7 +138,7 @@ router.get('/users', async (req, res) => {
     const users = await User.find({ 
       createdBy: req.user._id,
       role: { $in: ['user', 'client'] } 
-    }).select('-password').sort({ createdAt: -1 });
+    }).select('-password').sort({ createdAt: -1 }).lean();
     
     res.json({
       success: true,
@@ -150,7 +163,8 @@ router.get('/business-users', async (req, res) => {
       ]
     })
     .select('username email contactNumber businessName')
-    .sort({ businessName: 1 });
+    .sort({ businessName: 1 })
+    .lean();
 
     res.json({
       success: true,
@@ -188,7 +202,8 @@ router.get('/services', async (req, res) => {
       .populate('createdBy', 'username email role contactNumber')
       .populate('assignedTo', 'username email contactNumber')
       .populate('services.assignedTo', 'username email contactNumber')
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .lean();
 
     res.json({
       success: true,
@@ -239,6 +254,22 @@ router.post('/users', async (req, res) => {
       });
     }
 
+    if (!contactNumber || !contactNumber.toString().trim()) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Contact number is required' 
+      });
+    }
+
+    const cleanContactNumber = contactNumber.toString().trim().replace(/[\s-]/g, '');
+    const mobileRegex = /^[0-9]{10,15}$/;
+    if (!mobileRegex.test(cleanContactNumber)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Please enter a valid mobile number (10-15 digits)' 
+      });
+    }
+
     if (password.length < 6) {
       return res.status(400).json({ 
         success: false, 
@@ -262,37 +293,54 @@ router.post('/users', async (req, res) => {
       });
     }
 
-    // Check if user exists
-    const searchConditions = [{ username }];
-    if (email && email.trim()) {
-      searchConditions.push({ email: email.trim().toLowerCase() });
-    }
-    const existingUser = await User.findOne({ 
-      $or: searchConditions 
-    });
-
-    if (existingUser) {
+    // Check if contact number already exists
+    const existingContact = await User.findOne({ contactNumber: cleanContactNumber });
+    if (existingContact) {
       return res.status(400).json({
         success: false,
-        message: 'User already exists with this email or username'
+        message: 'User with this contact number already exists'
       });
+    }
+
+    // Check if username already exists
+    const existingUsername = await User.findOne({ username: username.trim() });
+    if (existingUsername) {
+      return res.status(400).json({
+        success: false,
+        message: 'Username is already taken'
+      });
+    }
+
+    // Check if email already exists (only if email is provided and non-empty)
+    if (email && typeof email === 'string' && email.trim()) {
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(email.trim())) {
+        return res.status(400).json({
+          success: false,
+          message: 'Please enter a valid email address'
+        });
+      }
+      const existingEmail = await User.findOne({ email: email.trim().toLowerCase() });
+      if (existingEmail) {
+        return res.status(400).json({
+          success: false,
+          message: 'User with this email already exists'
+        });
+      }
     }
 
     // Create user data object
     const userData = { 
-      username, 
+      username: username.trim(), 
+      contactNumber: cleanContactNumber,
       password, 
       role,
       createdBy: req.user._id // Track who created this user
     };
 
-    if (email && email.trim()) {
+    // Email is strictly optional - only set if provided and non-empty
+    if (email && typeof email === 'string' && email.trim()) {
       userData.email = email.trim().toLowerCase();
-    }
-
-    // Add optional fields if provided
-    if (contactNumber) {
-      userData.contactNumber = contactNumber;
     }
 
     if (role === 'client') {
@@ -309,7 +357,7 @@ router.post('/users', async (req, res) => {
       user: {
         id: user._id,
         username: user.username,
-        email: user.email,
+        email: user.email || '',
         contactNumber: user.contactNumber || '',
         role: user.role,
         businessName: user.businessName,
@@ -319,6 +367,26 @@ router.post('/users', async (req, res) => {
 
   } catch (error) {
     console.error('Create user error:', error);
+    if (error.code === 11000) {
+      if (error.keyPattern?.contactNumber || error.message?.includes('contactNumber')) {
+        return res.status(400).json({
+          success: false,
+          message: 'User with this contact number already exists'
+        });
+      }
+      if (error.keyPattern?.username || error.message?.includes('username')) {
+        return res.status(400).json({
+          success: false,
+          message: 'Username is already taken'
+        });
+      }
+      if ((error.keyPattern?.email || error.message?.includes('email')) && req.body.email && req.body.email.toString().trim()) {
+        return res.status(400).json({
+          success: false,
+          message: 'User with this email already exists'
+        });
+      }
+    }
     res.status(500).json({
       success: false,
       message: 'Error creating user: ' + error.message
@@ -360,34 +428,65 @@ router.put('/users/:id', async (req, res) => {
       });
     }
 
-    // Check if email or username already exists (excluding current user)
-    const searchConditions = [{ username }];
-    if (email && email.trim()) {
-      searchConditions.push({ email: email.trim().toLowerCase() });
-    }
+    // Check if username already exists (excluding current user)
     const duplicateUser = await User.findOne({
-      $and: [
-        { _id: { $ne: req.params.id } },
-        { $or: searchConditions }
-      ]
+      _id: { $ne: req.params.id },
+      username: username.trim()
     });
 
     if (duplicateUser) {
       return res.status(400).json({
         success: false,
-        message: 'Username or email already exists'
+        message: 'Username is already taken'
       });
     }
 
     // Prepare update data
     const updateData = { 
-      username, 
-      role,
-      contactNumber: contactNumber || '' // Set to empty string if not provided
+      username: username.trim(), 
+      role
     };
 
+    // Check if contactNumber already exists (excluding current user)
+    if (contactNumber && contactNumber.toString().trim()) {
+      const cleanContactNumber = contactNumber.toString().trim().replace(/[\s-]/g, '');
+      const mobileRegex = /^[0-9]{10,15}$/;
+      if (!mobileRegex.test(cleanContactNumber)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Please enter a valid mobile number (10-15 digits)'
+        });
+      }
+      const existingContact = await User.findOne({
+        _id: { $ne: req.params.id },
+        contactNumber: cleanContactNumber
+      });
+      if (existingContact) {
+        return res.status(400).json({
+          success: false,
+          message: 'User with this contact number already exists'
+        });
+      }
+      updateData.contactNumber = cleanContactNumber;
+    }
+
     if (email !== undefined) {
-      updateData.email = email && email.trim() ? email.trim().toLowerCase() : null;
+      if (email && typeof email === 'string' && email.trim()) {
+        const cleanEmail = email.trim().toLowerCase();
+        const existingEmail = await User.findOne({
+          _id: { $ne: req.params.id },
+          email: cleanEmail
+        });
+        if (existingEmail) {
+          return res.status(400).json({
+            success: false,
+            message: 'User with this email already exists'
+          });
+        }
+        updateData.email = cleanEmail;
+      } else {
+        updateData.$unset = { email: 1 };
+      }
     }
     
     // Only include businessName if role is client
@@ -417,6 +516,26 @@ router.put('/users/:id', async (req, res) => {
 
   } catch (error) {
     console.error('Update user error:', error);
+    if (error.code === 11000) {
+      if (error.keyPattern?.contactNumber || error.message?.includes('contactNumber')) {
+        return res.status(400).json({
+          success: false,
+          message: 'User with this contact number already exists'
+        });
+      }
+      if (error.keyPattern?.username || error.message?.includes('username')) {
+        return res.status(400).json({
+          success: false,
+          message: 'Username is already taken'
+        });
+      }
+      if ((error.keyPattern?.email || error.message?.includes('email')) && req.body.email && req.body.email.toString().trim()) {
+        return res.status(400).json({
+          success: false,
+          message: 'User with this email already exists'
+        });
+      }
+    }
     res.status(500).json({
       success: false,
       message: 'Error updating user: ' + error.message
@@ -589,7 +708,10 @@ router.delete('/services/:serviceId/items/:itemId', async (req, res) => {
 router.patch('/services/:id/assign', async (req, res) => {
   try {
     const { assignedTo, assignAll, serviceIndex } = req.body;
-    const serviceId = req.params.id;
+    const rawId = String(req.params.id || '');
+    const idMatch = rawId.match(/^([0-9a-fA-F]{24})[_-](\d+)$/);
+    const serviceId = idMatch ? idMatch[1] : rawId;
+    const extractedIdx = idMatch ? Number(idMatch[2]) : undefined;
 
     console.log('=== OWNER ASSIGN SERVICE REQUEST ===');
     console.log('Service ID:', serviceId);
@@ -631,14 +753,9 @@ router.patch('/services/:id/assign', async (req, res) => {
         });
       }
 
-      // Check if worker was created by this owner OR is the owner themselves
       const assignedUser = await User.findOne({
         _id: assignedTo,
-        $or: [
-          { createdBy: req.user._id },
-          { _id: req.user._id } // Allow assigning to self if owner is also a worker
-        ],
-        role: 'user'
+        role: { $in: ['user', 'executive'] }
       });
       
       if (!assignedUser) {
@@ -656,20 +773,47 @@ router.patch('/services/:id/assign', async (req, res) => {
 
     // Handle assignment based on assignAll flag
     const hasSubServices = service.services && service.services.length > 0;
-    const isAssignSingle = (assignAll === false || assignAll === 'false') && 
-                           serviceIndex !== undefined && 
-                           serviceIndex !== null && 
-                           !isNaN(Number(serviceIndex));
+    const isSingleSubServiceOrder = hasSubServices && service.services.length === 1;
+    const resolvedIdx =
+      serviceIndex !== undefined && serviceIndex !== null && !isNaN(Number(serviceIndex))
+        ? Number(serviceIndex)
+        : extractedIdx !== undefined
+        ? extractedIdx
+        : null;
+    const isAssignSingle =
+      !isSingleSubServiceOrder &&
+      (assignAll === false || assignAll === 'false') &&
+      resolvedIdx !== null &&
+      service.services &&
+      Boolean(service.services[resolvedIdx]);
 
     if (hasSubServices && isAssignSingle) {
-      // Assign to specific service item only
-      const idx = Number(serviceIndex);
-      if (service.services[idx]) {
-        service.services[idx].assignedTo = workerVal;
-        console.log(`✅ Assigned to service item ${idx}`);
+      // First preserve any existing parent-level assignment onto sub-services that didn't have an explicit sub-service assignment
+      if (service.assignedTo) {
+        service.services.forEach((s) => {
+          if (!s.assignedTo) {
+            s.assignedTo = service.assignedTo;
+          }
+        });
       }
-      // Also set parent assignedTo to the same worker so it shows up in parent view
-      service.assignedTo = workerVal;
+
+      // Assign to specific service item only
+      service.services[resolvedIdx].assignedTo = workerVal;
+      console.log(`✅ Assigned to service item ${resolvedIdx}`);
+      
+      const assignedWorkers = service.services.map(s => s.assignedTo ? (s.assignedTo._id || s.assignedTo).toString() : null);
+      const firstNonNullWorker = service.services.find(s => s.assignedTo)?.assignedTo || null;
+      const firstWorker = assignedWorkers[0];
+      const allSame = firstWorker !== null && assignedWorkers.every(w => w === firstWorker);
+      const allUnassigned = assignedWorkers.every(w => w === null);
+
+      if (allSame) {
+        service.assignedTo = service.services[0].assignedTo;
+      } else if (allUnassigned) {
+        service.assignedTo = null;
+      } else {
+        service.assignedTo = firstNonNullWorker;
+      }
     } else {
       // Assign to entire service (all items)
       service.assignedTo = workerVal;

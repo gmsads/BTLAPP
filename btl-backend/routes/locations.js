@@ -5,6 +5,23 @@ const LocationLog = require('../models/LocationLog');
 
 const router = express.Router();
 
+const locAuthCache = new Map();
+const LOC_AUTH_TTL_MS = 15000;
+
+async function getCachedAuthUser(userId) {
+  const key = String(userId);
+  const cached = locAuthCache.get(key);
+  if (cached && Date.now() - cached.ts < LOC_AUTH_TTL_MS) {
+    return cached.user;
+  }
+  const user = await User.findById(userId).select('-password');
+  if (user) {
+    if (locAuthCache.size > 500) locAuthCache.clear();
+    locAuthCache.set(key, { user, ts: Date.now() });
+  }
+  return user;
+}
+
 // General Auth Middleware
 const auth = async (req, res, next) => {
   try {
@@ -14,7 +31,7 @@ const auth = async (req, res, next) => {
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.userId).select('-password');
+    const user = await getCachedAuthUser(decoded.userId);
     if (!user) {
       return res.status(401).json({ success: false, message: 'Invalid token' });
     }
@@ -36,7 +53,7 @@ const managerAuth = async (req, res, next) => {
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.userId).select('-password');
+    const user = await getCachedAuthUser(decoded.userId);
     if (!user) {
       return res.status(401).json({ success: false, message: 'Invalid token' });
     }
@@ -63,12 +80,16 @@ async function getExactAddress(lat, lng) {
   }
 
   try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 2500);
     const url = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`;
     const response = await fetch(url, {
       headers: {
         'User-Agent': 'BTLManager/1.0 (LiveLocationTracker)'
-      }
+      },
+      signal: controller.signal
     });
+    clearTimeout(timeoutId);
 
     if (!response.ok) {
       throw new Error(`Nominatim responded with status ${response.status}`);
@@ -134,22 +155,7 @@ router.post('/track', auth, async (req, res) => {
     // Resolve exact location name
     const geo = await getExactAddress(numLat, numLng);
 
-    // Save snapshot log
-    const log = new LocationLog({
-      user: req.user._id,
-      coordinates: {
-        lat: numLat,
-        lng: numLng
-      },
-      accuracy: accuracy || null,
-      locationName: geo.locationName,
-      addressDetails: geo.addressDetails,
-      source: source || 'auto_30min',
-      recordedAt: new Date()
-    });
-    await log.save();
-
-    // Update user's lastKnownLocation and mark permission granted
+    // Always update user's lastKnownLocation and mark permission granted for real-time tracking
     const updatedUser = await User.findByIdAndUpdate(
       req.user._id,
       {
@@ -168,13 +174,37 @@ router.post('/track', auth, async (req, res) => {
       { new: true }
     ).select('-password');
 
+    // Only save a new waypoint in LocationLog every 30 minutes
+    const THIRTY_MINUTES_MS = 30 * 60 * 1000;
+    const lastLog = await LocationLog.findOne({ user: req.user._id }).sort({ recordedAt: -1 });
+    const shouldRecordWaypoint = !lastLog || (Date.now() - new Date(lastLog.recordedAt).getTime()) >= THIRTY_MINUTES_MS;
+
+    let savedTime = new Date();
+    if (shouldRecordWaypoint) {
+      const log = new LocationLog({
+        user: req.user._id,
+        coordinates: {
+          lat: numLat,
+          lng: numLng
+        },
+        accuracy: accuracy || null,
+        locationName: geo.locationName,
+        addressDetails: geo.addressDetails,
+        source: source || 'auto_30min',
+        recordedAt: savedTime
+      });
+      await log.save();
+    } else if (lastLog) {
+      savedTime = lastLog.recordedAt;
+    }
+
     res.json({
       success: true,
       message: 'Location tracked successfully',
       data: {
         locationName: geo.locationName,
         coordinates: { lat: numLat, lng: numLng },
-        updatedAt: log.recordedAt
+        updatedAt: savedTime
       }
     });
   } catch (error) {
@@ -209,33 +239,73 @@ router.get('/live', managerAuth, async (req, res) => {
     const Service = require('../models/Service');
     const Worker = require('../models/Worker');
 
-    // Fetch users who are field workers / executives (role 'user' or any non-client)
-    const users = await User.find({
-      role: { $in: ['user', 'admin', 'owner'] } // can see all active personnel
-    }).select('username contactNumber email role lastKnownLocation locationPermissionGranted updatedAt createdAt');
-
-    // Fetch active services to identify what vehicle/van/auto each worker is running
-    const activeServices = await Service.find({
-      status: { $in: ['pending', 'active'] }
-    }).select('businessName serviceType services assignedTo primaryLocation startDate deliveryDate');
-
-    // Fetch worker profiles for vehicle numbers
-    const workerProfiles = await Worker.find().select('workerName contactNumber serviceType vehicleDetails');
-
     const now = Date.now();
-    const ACTIVE_THRESHOLD_MS = 40 * 60 * 1000; // 40 minutes (30m interval + 10m buffer)
+    const ONE_HOUR_MS = 60 * 60 * 1000; // 1 hour threshold
+
+    const [users, activeServices, workerProfiles, recentLogs] = await Promise.all([
+      User.find({
+        role: { $in: ['user', 'admin', 'owner'] }
+      }).select('username contactNumber email role lastKnownLocation locationPermissionGranted updatedAt createdAt').lean(),
+      Service.find({
+        status: { $in: ['pending', 'active'] }
+      }).select('businessName serviceType services assignedTo primaryLocation startDate deliveryDate').lean(),
+      Worker.find().select('workerName contactNumber serviceType vehicleDetails').lean(),
+      LocationLog.find({
+        recordedAt: { $gte: new Date(now - 2 * ONE_HOUR_MS) }
+      }).select('user coordinates recordedAt').sort({ recordedAt: -1 }).lean()
+    ]);
 
     const workers = users.map(user => {
       const lastLoc = user.lastKnownLocation;
       const hasLocation = lastLoc && lastLoc.coordinates && lastLoc.coordinates.lat !== undefined && lastLoc.coordinates.lng !== undefined;
       
       let isOnline = false;
+      let isLive = false;
+      let isMoving = false;
       let minutesAgo = null;
 
       if (hasLocation && lastLoc.updatedAt) {
         const diffMs = now - new Date(lastLoc.updatedAt).getTime();
         minutesAgo = Math.max(0, Math.round(diffMs / (60 * 1000)));
-        isOnline = diffMs <= ACTIVE_THRESHOLD_MS;
+
+        // If not updated within 1 hr (60 minutes), it has not moved > 1 hr -> Show last location, NOT live
+        if (diffMs <= ONE_HOUR_MS) {
+          // Check if vehicle has actually moved or has been stationary in same spot
+          const userLogs = recentLogs.filter(l => l.user.toString() === user._id.toString());
+          if (userLogs.length >= 2) {
+            const newest = userLogs[0].coordinates;
+            const oldestInWindow = userLogs[userLogs.length - 1].coordinates;
+            
+            // Haversine distance
+            const R = 6371000;
+            const dLat = (oldestInWindow.lat - newest.lat) * Math.PI / 180;
+            const dLon = (oldestInWindow.lng - newest.lng) * Math.PI / 180;
+            const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                      Math.cos(newest.lat * Math.PI / 180) * Math.cos(oldestInWindow.lat * Math.PI / 180) *
+                      Math.sin(dLon / 2) * Math.sin(dLon / 2);
+            const dist = R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+            const timeDiffMin = Math.round((new Date(userLogs[0].recordedAt).getTime() - new Date(userLogs[userLogs.length - 1].recordedAt).getTime()) / (60 * 1000));
+
+            // If at the exact same spot (< 50 meters) for 60+ minutes, not moved > 1 hr
+            if (timeDiffMin >= 60 && dist < 50) {
+              isMoving = false;
+              isLive = false;
+            } else {
+              isMoving = true;
+              isLive = true;
+            }
+          } else {
+            // Reported recently within the last hour
+            isMoving = true;
+            isLive = true;
+          }
+        } else {
+          // diffMs > 1 hour -> Not moved in more than 1 hr, show last location, NOT live
+          isMoving = false;
+          isLive = false;
+        }
+
+        isOnline = isLive;
       }
 
       // Check what vans, autos, or services this worker is running
@@ -279,6 +349,9 @@ router.get('/live', managerAuth, async (req, res) => {
         addressDetails: hasLocation ? lastLoc.addressDetails : null,
         lastUpdated: hasLocation ? lastLoc.updatedAt : null,
         isOnline,
+        isLive,
+        isMoving,
+        status: isLive ? 'live' : 'last_location',
         minutesAgo,
         runningServices: assigned,
         vehicleDetails,
@@ -320,10 +393,40 @@ router.get('/history/:userId', managerAuth, async (req, res) => {
       endOfDay.setHours(23, 59, 59, 999);
     }
 
-    const logs = await LocationLog.find({
+    const allLogs = await LocationLog.find({
       user: userId,
       recordedAt: { $gte: startOfDay, $lte: endOfDay }
     }).sort({ recordedAt: 1 });
+
+    // Filter waypoints so they only show at 30-minute intervals (not every minute)
+    const THIRTY_MINUTES_MS = 30 * 60 * 1000;
+    const logs = [];
+
+    if (allLogs.length > 0) {
+      // 1. Always include the very first point of the day (Start Point)
+      logs.push(allLogs[0]);
+      let lastIncludedTime = new Date(allLogs[0].recordedAt).getTime();
+
+      // 2. Include intermediate points spaced by at least 30 minutes
+      for (let i = 1; i < allLogs.length; i++) {
+        const itemTime = new Date(allLogs[i].recordedAt).getTime();
+        if (itemTime - lastIncludedTime >= THIRTY_MINUTES_MS) {
+          logs.push(allLogs[i]);
+          lastIncludedTime = itemTime;
+        }
+      }
+
+      // 3. If the latest available log is at least 15 minutes past the last included point,
+      // and not already in logs, include it as the latest / live position
+      const latestLog = allLogs[allLogs.length - 1];
+      const latestTime = new Date(latestLog.recordedAt).getTime();
+      const lastInArray = logs[logs.length - 1];
+      const lastInArrayTime = new Date(lastInArray.recordedAt).getTime();
+
+      if (latestLog._id.toString() !== lastInArray._id.toString() && (latestTime - lastInArrayTime) >= 15 * 60 * 1000) {
+        logs.push(latestLog);
+      }
+    }
 
     const worker = await User.findById(userId).select('username contactNumber');
 

@@ -514,9 +514,9 @@ const HomePage = ({ onLogin }) => {
       return;
     }
 
-    if (registerFormData.email) {
+    if (registerFormData.email && registerFormData.email.trim()) {
       const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!emailRegex.test(registerFormData.email)) {
+      if (!emailRegex.test(registerFormData.email.trim())) {
         setMessage('Please enter a valid email address');
         setLoading(false);
         return;
@@ -525,10 +525,10 @@ const HomePage = ({ onLogin }) => {
 
     try {
       const response = await axios.post('/auth/register', {
-        username: registerFormData.username,
-        contactNumber: registerFormData.contactNumber,
+        username: registerFormData.username.trim(),
+        contactNumber: registerFormData.contactNumber.trim(),
         password: registerFormData.password,
-        email: registerFormData.email || undefined,
+        email: registerFormData.email && registerFormData.email.trim() ? registerFormData.email.trim() : undefined,
         role: registerFormData.role,
         businessName: registerFormData.role === 'client' ? registerFormData.businessName : undefined,
         ownerLevel: registerFormData.role === 'owner' ? registerFormData.ownerLevel : undefined

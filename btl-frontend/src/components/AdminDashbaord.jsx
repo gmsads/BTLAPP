@@ -351,11 +351,9 @@ const AdminDashboard = ({ user, onLogout }) => {
       if (response.data.success) {
         setMessage('Service assigned successfully!');
         setAssigningService(null);
-        if (activeTab === 'all-services') {
-          fetchAllServices();
-        } else if (activeTab === 'active-services') {
-          fetchActiveServices();
-        }
+        fetchAllServices();
+        fetchActiveServices();
+        fetchStats();
       }
     } catch (error) {
       const errorMsg = error.response?.data?.message || error.message;
@@ -378,11 +376,9 @@ const AdminDashboard = ({ user, onLogout }) => {
       });
       if (response.data.success) {
         setMessage('Service unassigned successfully!');
-        if (activeTab === 'all-services') {
-          fetchAllServices();
-        } else if (activeTab === 'active-services') {
-          fetchActiveServices();
-        }
+        fetchAllServices();
+        fetchActiveServices();
+        fetchStats();
       }
     } catch (error) {
       setMessage('Error unassigning service: ' + (error.response?.data?.message || error.message));
@@ -475,9 +471,9 @@ const AdminDashboard = ({ user, onLogout }) => {
       return allServices.filter(service => service.status === selectedData.filter.value);
     } else if (selectedData.filter.type === 'assigned') {
       if (selectedData.filter.value === true) {
-        return allServices.filter(service => service.assignedTo);
+        return allServices.filter(service => service.assignedTo || (service.services && service.services.some(s => s.assignedTo)));
       } else {
-        return allServices.filter(service => !service.assignedTo);
+        return allServices.filter(service => !service.assignedTo || (service.services && service.services.some(s => !s.assignedTo)));
       }
     }
 
@@ -490,9 +486,9 @@ const AdminDashboard = ({ user, onLogout }) => {
 
     if (selectedData.filter.type === 'assigned') {
       if (selectedData.filter.value === true) {
-        return activeServices.filter(service => service.assignedTo);
+        return activeServices.filter(service => service.assignedTo || (service.services && service.services.some(s => s.assignedTo)));
       } else {
-        return activeServices.filter(service => !service.assignedTo);
+        return activeServices.filter(service => !service.assignedTo || (service.services && service.services.some(s => !s.assignedTo)));
       }
     }
 
@@ -2286,6 +2282,13 @@ const renderAllServices = () => {
           ))
         ].filter((img, i, arr) => arr.findIndex(t => (t.public_id && t.public_id === img.public_id) || (t.url && t.url === img.url) || ((t._id || t.id) && (img._id || img.id) && (t._id || t.id).toString() === (img._id || img.id).toString())) === i);
 
+        const itemAssignedTo = serviceItem.assignedTo || (service.assignedTo && !service.services.some(s => s.assignedTo) ? service.assignedTo : null);
+
+        if (selectedData.filter && selectedData.filter.type === 'assigned') {
+          if (selectedData.filter.value === true && !itemAssignedTo) return;
+          if (selectedData.filter.value === false && itemAssignedTo) return;
+        }
+
         expandedServices.push({
           ...service,
           _originalId: service._id,
@@ -2297,7 +2300,7 @@ const renderAllServices = () => {
           location: serviceItem.location || service.primaryLocation || service.location,
           notes: serviceItem.notes || '',
           itemStatus: serviceItem.status || 'pending',
-          assignedTo: serviceItem.assignedTo || (service.assignedTo && !service.services.some(s => s.assignedTo) ? service.assignedTo : null),
+          assignedTo: itemAssignedTo,
           images: itemImages,
           isMultiService: true,
           serviceIndex: index,
@@ -2306,6 +2309,12 @@ const renderAllServices = () => {
         });
       });
     } else {
+      const itemAssignedTo = service.assignedTo || null;
+      if (selectedData.filter && selectedData.filter.type === 'assigned') {
+        if (selectedData.filter.value === true && !itemAssignedTo) return;
+        if (selectedData.filter.value === false && itemAssignedTo) return;
+      }
+
       expandedServices.push({
         ...service,
         _originalId: service._id,
@@ -2317,7 +2326,8 @@ const renderAllServices = () => {
         quantity: service.quantity || 0,
         location: service.location || service.primaryLocation,
         serviceName: `${service.businessName} - ${service.serviceType === 'other' ? service.customServiceType : service.serviceType}`,
-        itemStatus: service.status || 'pending'
+        itemStatus: service.status || 'pending',
+        assignedTo: itemAssignedTo
       });
     }
   });
@@ -3067,6 +3077,69 @@ const renderAllServices = () => {
     const filteredActiveServices = getFilteredActiveServices();
     const showAllActiveServices = !selectedData.filter;
 
+    // Expand multi-services for active services view
+    const expandedActiveServices = [];
+    filteredActiveServices.forEach(service => {
+      if (service.services && Array.isArray(service.services) && service.services.length > 0) {
+        service.services.forEach((serviceItem, index) => {
+          const itemImages = [
+            ...((serviceItem.images || []).filter(Boolean)),
+            ...((service.images || []).filter(img =>
+              (img.itemId && serviceItem._id && img.itemId.toString() === serviceItem._id.toString()) ||
+              (img.serviceIndex !== undefined && img.serviceIndex !== null && Number(img.serviceIndex) === index)
+            ))
+          ].filter((img, i, arr) => arr.findIndex(t => (t.public_id && t.public_id === img.public_id) || (t.url && t.url === img.url) || ((t._id || t.id) && (img._id || img.id) && (t._id || t.id).toString() === (img._id || img.id).toString())) === i);
+
+          const itemAssignedTo = serviceItem.assignedTo || (service.assignedTo && !service.services.some(s => s.assignedTo) ? service.assignedTo : null);
+
+          if (selectedData.filter && selectedData.filter.type === 'assigned') {
+            if (selectedData.filter.value === true && !itemAssignedTo) return;
+            if (selectedData.filter.value === false && itemAssignedTo) return;
+          }
+
+          expandedActiveServices.push({
+            ...service,
+            _originalId: service._id,
+            _id: serviceItem._id || `${service._id}-${index}`,
+            _rowId: `${service._id}-${serviceItem._id || index}`,
+            serviceType: serviceItem.serviceType,
+            customServiceType: serviceItem.customServiceType,
+            quantity: serviceItem.quantity,
+            location: serviceItem.location || service.primaryLocation || service.location,
+            notes: serviceItem.notes || '',
+            itemStatus: serviceItem.status || 'pending',
+            assignedTo: itemAssignedTo,
+            images: itemImages,
+            isMultiService: true,
+            serviceIndex: index,
+            totalServices: service.services.length,
+            serviceName: `${service.businessName} - ${serviceItem.serviceType === 'other' ? serviceItem.customServiceType : serviceItem.serviceType}`
+          });
+        });
+      } else {
+        const itemAssignedTo = service.assignedTo || null;
+        if (selectedData.filter && selectedData.filter.type === 'assigned') {
+          if (selectedData.filter.value === true && !itemAssignedTo) return;
+          if (selectedData.filter.value === false && itemAssignedTo) return;
+        }
+
+        expandedActiveServices.push({
+          ...service,
+          _originalId: service._id,
+          _id: service._id,
+          _rowId: service._id,
+          isMultiService: false,
+          serviceIndex: 0,
+          totalServices: 1,
+          quantity: service.quantity || 0,
+          location: service.location || service.primaryLocation,
+          serviceName: `${service.businessName} - ${service.serviceType === 'other' ? service.customServiceType : service.serviceType}`,
+          itemStatus: service.status || 'pending',
+          assignedTo: itemAssignedTo
+        });
+      }
+    });
+
     return (
       <div>
         <div style={{
@@ -3094,7 +3167,7 @@ const renderAllServices = () => {
                 fontSize: isMobile ? '12px' : '14px',
                 fontWeight: '600'
               }}>
-                {filteredActiveServices.length} Active
+                {expandedActiveServices.length} Active
               </span>
             </h3>
 
@@ -3176,7 +3249,7 @@ const renderAllServices = () => {
           }}>
             Loading {selectedData.title?.toLowerCase() || 'active services'}...
           </div>
-        ) : filteredActiveServices.length === 0 ? (
+        ) : expandedActiveServices.length === 0 ? (
           <div style={{
             textAlign: 'center',
             padding: isMobile ? '40px' : '60px',
@@ -3217,8 +3290,8 @@ const renderAllServices = () => {
           </div>
         ) : (
           <div>
-            {filteredActiveServices.map((service) => (
-              <div key={service._id} style={{
+            {expandedActiveServices.map((service) => (
+              <div key={service._rowId || service._id} style={{
                 ...cardStyle,
                 borderLeft: `4px solid ${colors.success}`,
                 background: '#f0fff4',
@@ -3240,6 +3313,19 @@ const renderAllServices = () => {
                       fontWeight: '700'
                     }}>
                       {service.businessName}
+                      {service.isMultiService && (
+                        <span style={{
+                          marginLeft: '8px',
+                          padding: '2px 8px',
+                          background: colors.info,
+                          color: colors.white,
+                          borderRadius: '4px',
+                          fontSize: '11px',
+                          fontWeight: '600'
+                        }}>
+                          Item {service.serviceIndex + 1} of {service.totalServices}
+                        </span>
+                      )}
                     </h4>
                     <p style={{
                       margin: '0 0 6px 0',
@@ -3425,7 +3511,7 @@ const renderAllServices = () => {
                       </button>
                     )}
                     <button
-                      onClick={() => deleteService(service._id)}
+                      onClick={() => deleteService(service._originalId || service._id)}
                       style={buttonStyle(colors.danger, 'small')}
                     >
                       🗑️ {isMobile ? '' : 'Delete'}
@@ -3811,7 +3897,11 @@ const AddUserForm = ({ onUserAdded, isMobile, colors, buttonStyle }) => {
     setMessage('');
 
     try {
-      const response = await axios.post('/admin/users', formData);
+      const payload = {
+        ...formData,
+        email: formData.email && formData.email.trim() ? formData.email.trim() : undefined
+      };
+      const response = await axios.post('/admin/users', payload);
       if (response.data.success) {
         setMessage('User created successfully!');
         setFormData({
@@ -3827,7 +3917,7 @@ const AddUserForm = ({ onUserAdded, isMobile, colors, buttonStyle }) => {
         onUserAdded();
       }
     } catch (error) {
-      setMessage('Error creating user: ' + (error.response?.data?.message || error.message));
+      setMessage(error.response?.data?.message || ('Error creating user: ' + error.message));
     } finally {
       setLoading(false);
     }
@@ -3916,9 +4006,11 @@ const AddUserForm = ({ onUserAdded, isMobile, colors, buttonStyle }) => {
         <input
           type="tel"
           name="contactNumber"
-          placeholder="Contact Number (e.g., +1234567890)"
+          placeholder="Contact Number (10-15 digits)"
           value={formData.contactNumber}
           onChange={handleChange}
+          required
+          pattern="[0-9]{10,15}"
           style={inputStyle}
         />
         <input
@@ -4015,7 +4107,11 @@ const EditUserForm = ({ user, onUserUpdated, isMobile, colors, buttonStyle }) =>
     setMessage('');
 
     try {
-      const response = await axios.put(`/admin/users/${user._id}`, formData);
+      const payload = {
+        ...formData,
+        email: formData.email && formData.email.trim() ? formData.email.trim() : undefined
+      };
+      const response = await axios.put(`/admin/users/${user._id}`, payload);
       if (response.data.success) {
         setMessage('User updated successfully!');
         setShowForm(false);
@@ -4129,9 +4225,11 @@ const EditUserForm = ({ user, onUserUpdated, isMobile, colors, buttonStyle }) =>
           <input
             type="tel"
             name="contactNumber"
-            placeholder="Contact Number (e.g., +1234567890)"
+            placeholder="Contact Number (10-15 digits)"
             value={formData.contactNumber}
             onChange={handleChange}
+            required
+            pattern="[0-9]{10,15}"
             style={inputStyle}
           />
           <select

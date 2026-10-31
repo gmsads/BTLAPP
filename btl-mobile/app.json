@@ -1,0 +1,59 @@
+{
+  "expo": {
+    "name": "BTL Manager",
+    "slug": "btl-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0151ba"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "in.btlmanager.mobile",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Allow BTL Manager to capture geo-tagged campaign proof and odometer photos.",
+        "NSPhotoLibraryUsageDescription": "Allow BTL Manager to upload campaign proof photos from your gallery.",
+        "NSLocationWhenInUseUsageDescription": "Allow BTL Manager to tag campaign photos and log your active field location."
+      }
+    },
+    "android": {
+      "package": "in.btlmanager.mobile",
+      "adaptiveIcon": {
+        "backgroundColor": "#0151ba",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "permissions": [
+        "CAMERA",
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-sharing",
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Allow BTL Manager to track your active campaign location."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow BTL Manager to select campaign proof photos.",
+          "cameraPermission": "Allow BTL Manager to capture live campaign photos."
+        }
+      ]
+    ]
+  }
+}

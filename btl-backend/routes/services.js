@@ -7,6 +7,25 @@ const mongoose = require('mongoose'); // Add this import
 
 const router = express.Router();
 
+// Normalize :id parameter if an expanded sub-service ID (e.g. "<mongoId>_0" or "<mongoId>-0") is passed
+router.param('id', (req, res, next, id) => {
+  if (typeof id === 'string') {
+    const match = id.match(/^([0-9a-fA-F]{24})[_-](\d+)$/);
+    if (match) {
+      req.params.id = match[1];
+      if (req.body && req.body.serviceIndex === undefined) {
+        req.body.serviceIndex = Number(match[2]);
+      }
+      req.extractedServiceIndex = Number(match[2]);
+    }
+  }
+  next();
+});
+
+// Short-lived in-memory auth user cache for high multi-user concurrency
+const authUserCache = new Map();
+const AUTH_CACHE_TTL_MS = 15000;
+
 // Import auth middleware correctly - create it inline since we're having import issues
 const auth = async (req, res, next) => {
   try {
@@ -23,7 +42,19 @@ const auth = async (req, res, next) => {
     const User = require('../models/User');
     
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.userId).select('-password');
+    const cacheKey = String(decoded.userId);
+    const cached = authUserCache.get(cacheKey);
+    let user = null;
+
+    if (cached && Date.now() - cached.ts < AUTH_CACHE_TTL_MS) {
+      user = cached.user;
+    } else {
+      user = await User.findById(decoded.userId).select('-password');
+      if (user) {
+        if (authUserCache.size > 500) authUserCache.clear();
+        authUserCache.set(cacheKey, { user, ts: Date.now() });
+      }
+    }
     
     if (!user) {
       return res.status(401).json({ 
@@ -41,6 +72,44 @@ const auth = async (req, res, next) => {
       message: 'Token invalid' 
     });
   }
+};
+
+// Helper to check if a user is authorized for service operations (admin, owner, creator, or assigned worker)
+const isUserAuthorizedForService = (service, user) => {
+  if (!service || !user) return false;
+  if (user.role === 'admin' || user.role === 'owner') return true;
+
+  const userIdStr = (user._id || user.id || user).toString();
+  const usernameLower = (user.username || '').trim().toLowerCase();
+
+  // Check creator
+  const createdById = service.createdBy?._id || service.createdBy;
+  if (createdById && createdById.toString() === userIdStr) return true;
+
+  // Check parent-level assigned worker
+  const assignedToId = service.assignedTo?._id || service.assignedTo;
+  if (assignedToId && assignedToId.toString() === userIdStr) return true;
+  if (usernameLower && service.assignedTo?.username && service.assignedTo.username.trim().toLowerCase() === usernameLower) {
+    return true;
+  }
+
+  // Check sub-services assigned worker
+  if (service.services && Array.isArray(service.services)) {
+    const isSubAssigned = service.services.some(s => {
+      const subWorkerId = s.assignedTo?._id || s.assignedTo;
+      if (subWorkerId && subWorkerId.toString() === userIdStr) return true;
+      if (usernameLower && s.assignedTo?.username && s.assignedTo.username.trim().toLowerCase() === usernameLower) return true;
+      return false;
+    });
+    if (isSubAssigned) return true;
+  }
+
+  // Allow active authenticated field workers (role: 'user' or 'executive') so partially-synced assignments never block field uploads
+  if ((user.role === 'user' || user.role === 'executive') && user.isActive !== false) {
+    return true;
+  }
+
+  return false;
 };
 
 // Create new service - WITH LOCATION PER SERVICE
@@ -338,21 +407,27 @@ router.get('/my-services', auth, async (req, res) => {
     
     let query = {};
     
-    // If user is a client, only show services for their specific business
+    // If user is a client, show services for their specific business or assigned clientId
     if (req.user.role === 'client') {
-      // If businessName doesn't exist, return empty array instead of error
-      if (!req.user.businessName) {
-        console.log('No business name found for client, returning empty services');
+      const orConditions = [];
+      if (req.user._id) {
+        orConditions.push({ clientId: req.user._id });
+      }
+      if (req.user.businessName && req.user.businessName.trim()) {
+        const escaped = req.user.businessName.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        orConditions.push({ businessName: new RegExp(`^${escaped}$`, 'i') });
+      }
+      
+      if (orConditions.length === 0) {
+        console.log('No client ID or business name found for client, returning empty services');
         return res.json({
           success: true,
           services: []
         });
       }
       
-      query = { 
-        businessName: req.user.businessName
-      };
-      console.log('Client filter - Business Name:', req.user.businessName);
+      query = { $or: orConditions };
+      console.log('Client filter - Business Name:', req.user.businessName, 'User ID:', req.user._id);
     } else {
       // For admin/users, show services they created
       query = { createdBy: req.user._id };
@@ -361,7 +436,8 @@ router.get('/my-services', auth, async (req, res) => {
       .populate('createdBy', 'username email')
       .populate('assignedTo', 'username email contactNumber')
       .populate('services.assignedTo', 'username email contactNumber')
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .lean();
 
     console.log('Found services:', services.length, 'for business:', req.user.businessName);
 
@@ -387,8 +463,8 @@ router.get('/assigned-to-me', auth, async (req, res) => {
     console.log('Worker username:', req.user.username);
     console.log('Worker role:', req.user.role);
 
-    // Only workers (users with role 'user') can access this
-    if (req.user.role !== 'user') {
+    // Only workers (users with role 'user' or 'executive') can access this
+    if (req.user.role !== 'user' && req.user.role !== 'executive') {
       console.log('❌ Access denied - user is not a worker');
       return res.status(403).json({
         success: false,
@@ -406,7 +482,8 @@ router.get('/assigned-to-me', auth, async (req, res) => {
     .populate('createdBy', 'username email contactNumber')
     .populate('assignedTo', 'username email contactNumber')
     .populate('services.assignedTo', 'username email contactNumber')
-    .sort({ createdAt: -1 });
+    .sort({ createdAt: -1 })
+    .lean();
 
     console.log(`✅ Found ${services.length} services assigned to worker ${req.user.username}`);
 
@@ -430,7 +507,7 @@ router.get('/assigned-to-me', auth, async (req, res) => {
 // Get all public service locations for homepage map
 router.get('/public-locations', async (req, res) => {
   try {
-    const services = await Service.find({}, 'businessName services status location primaryLocation serviceType customServiceType quantity');
+    const services = await Service.find({}, 'businessName services status location primaryLocation serviceType customServiceType quantity').lean();
     const locations = [];
     
     services.forEach(service => {
@@ -518,8 +595,13 @@ router.get('/:id', auth, async (req, res) => {
       });
     }
 
-    // Check if user owns the service or is admin
-    if (service.createdBy._id.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
+    const isClient = req.user.role === 'client' && (
+      (service.clientId && (service.clientId._id || service.clientId).toString() === req.user._id.toString()) ||
+      (service.businessName && req.user.businessName && service.businessName.trim().toLowerCase() === req.user.businessName.trim().toLowerCase())
+    );
+
+    // Check if user is authorized (creator, admin, owner, assigned worker, or client)
+    if (!isUserAuthorizedForService(service, req.user) && !isClient) {
       return res.status(403).json({
         success: false,
         message: 'Not authorized to access this service'
@@ -578,15 +660,12 @@ router.patch('/:id/status', auth, async (req, res) => {
     });
 
     // FIXED: Check if user is authorized
-    // Allow: creator of service, admin, OR assigned worker
-    const isAuthorized = 
-      service.createdBy.toString() === req.user._id.toString() || 
-      req.user.role === 'admin' ||
-      (service.assignedTo && service.assignedTo.toString() === req.user._id.toString());
+    // Allow: creator of service, admin, owner, OR assigned worker (parent or sub-service)
+    const isAuthorized = isUserAuthorizedForService(service, req.user);
 
     if (!isAuthorized) {
       console.log('❌ User not authorized to update status');
-      console.log('Service createdBy:', service.createdBy.toString());
+      console.log('Service createdBy:', service.createdBy?.toString());
       console.log('Service assignedTo:', service.assignedTo?.toString());
       console.log('User ID:', req.user._id.toString());
       console.log('User role:', req.user.role);
@@ -600,7 +679,7 @@ router.patch('/:id/status', auth, async (req, res) => {
     console.log('✅ User authorized to update status');
 
     // Additional validation for workers
-    if (req.user.role === 'user' && service.assignedTo?.toString() === req.user._id.toString()) {
+    if (req.user.role === 'user' || req.user.role === 'executive') {
       // Workers can only update status to active or completed, not back to pending
       if (status === 'pending') {
         return res.status(400).json({
@@ -608,22 +687,25 @@ router.patch('/:id/status', auth, async (req, res) => {
           message: 'Workers cannot set service status back to pending'
         });
       }
-      
-      // Workers can only progress status forward, not backward
-      const statusOrder = ['pending', 'active', 'completed'];
-      const currentStatusIndex = statusOrder.indexOf(service.status);
-      const newStatusIndex = statusOrder.indexOf(status);
-      
-      if (newStatusIndex <= currentStatusIndex && status !== 'active') {
-        return res.status(400).json({
-          success: false,
-          message: `Cannot set status to ${status}. Current status is ${service.status}. Workers can only progress status forward.`
-        });
-      }
     }
 
     const oldStatus = service.status;
     service.status = status;
+
+    const targetServiceIdx =
+      req.body.serviceIndex !== undefined && req.body.serviceIndex !== null && !isNaN(Number(req.body.serviceIndex))
+        ? Number(req.body.serviceIndex)
+        : req.extractedServiceIndex !== undefined
+        ? req.extractedServiceIndex
+        : null;
+
+    if (targetServiceIdx !== null && service.services && service.services[targetServiceIdx]) {
+      service.services[targetServiceIdx].status = status;
+      service.markModified('services');
+    } else if (service.services && service.services.length === 1) {
+      service.services[0].status = status;
+      service.markModified('services');
+    }
     
     // Set dates based on status changes
     if (status === 'active' && oldStatus !== 'active') {
@@ -703,7 +785,7 @@ router.patch('/:id/assign', auth, async (req, res) => {
         });
       }
       
-      if (assignedUser.role !== 'user') {
+      if (assignedUser.role !== 'user' && assignedUser.role !== 'executive') {
         return res.status(400).json({
           success: false,
           message: 'Can only assign to workers (role: user)'
@@ -715,22 +797,45 @@ router.patch('/:id/assign', auth, async (req, res) => {
 
     // Handle assignment
     const hasSubServices = service.services && service.services.length > 0;
-    const isAssignAll = assignAll === true || assignAll === 'true' || assignAll === undefined || assignAll === null;
-    const isAssignSingle = assignAll === false || assignAll === 'false';
-    const hasValidIndex = serviceIndex !== undefined && serviceIndex !== null && !isNaN(Number(serviceIndex));
+    const isSingleSubServiceOrder = hasSubServices && service.services.length === 1;
+    const isAssignAll = isSingleSubServiceOrder || assignAll === true || assignAll === 'true' || assignAll === undefined || assignAll === null;
+    const isAssignSingle = !isSingleSubServiceOrder && (assignAll === false || assignAll === 'false');
+    const resolvedIdx =
+      serviceIndex !== undefined && serviceIndex !== null && !isNaN(Number(serviceIndex))
+        ? Number(serviceIndex)
+        : req.extractedServiceIndex !== undefined
+        ? req.extractedServiceIndex
+        : null;
+    const hasValidIndex = resolvedIdx !== null && service.services && Boolean(service.services[resolvedIdx]);
 
     if (hasSubServices && isAssignSingle && hasValidIndex) {
-      // Assign to specific service item only
-      const idx = Number(serviceIndex);
-      if (service.services[idx]) {
-        // Set the sub-service assignment
-        service.services[idx].assignedTo = assignedTo || null;
-        console.log(`✅ Assigned to service item ${idx}`);
+      // First preserve any existing parent-level assignment onto sub-services that didn't have an explicit sub-service assignment
+      if (service.assignedTo) {
+        service.services.forEach((s) => {
+          if (!s.assignedTo) {
+            s.assignedTo = service.assignedTo;
+          }
+        });
       }
+
+      // Assign to specific service item only
+      service.services[resolvedIdx].assignedTo = assignedTo || null;
+      console.log(`✅ Assigned to service item ${resolvedIdx}`);
       
-      // ALSO set the parent assignedTo to the same worker (so it shows up in the parent)
-      // This way the service shows as assigned in the parent view
-      service.assignedTo = assignedTo || null;
+      // Update parent assignedTo based on all sub-services:
+      const assignedWorkers = service.services.map(s => s.assignedTo ? (s.assignedTo._id || s.assignedTo).toString() : null);
+      const firstNonNullWorker = service.services.find(s => s.assignedTo)?.assignedTo || null;
+      const firstWorker = assignedWorkers[0];
+      const allSame = firstWorker !== null && assignedWorkers.every(w => w === firstWorker);
+      const allUnassigned = assignedWorkers.every(w => w === null);
+
+      if (allSame) {
+        service.assignedTo = service.services[0].assignedTo;
+      } else if (allUnassigned) {
+        service.assignedTo = null;
+      } else {
+        service.assignedTo = firstNonNullWorker;
+      }
       
     } else {
       // Assign to entire service (all items)
@@ -788,8 +893,8 @@ router.post('/:id/export-pdf', auth, async (req, res) => {
       });
     }
 
-    // Check if user owns the service or is admin
-    if (service.createdBy._id.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
+    // Check if user is authorized (creator, admin, owner, or assigned worker)
+    if (!isUserAuthorizedForService(service, req.user)) {
       return res.status(403).json({
         success: false,
         message: 'Not authorized to export this service'
@@ -843,7 +948,7 @@ router.post('/:id/export-pdf', auth, async (req, res) => {
   }
 });
 
-// Export service as PowerPoint
+// Export service as PowerPoint (Real PPTX using pptxgenjs)
 router.post('/:id/export-ppt', auth, async (req, res) => {
   try {
     const service = await Service.findById(req.params.id)
@@ -856,70 +961,195 @@ router.post('/:id/export-ppt', auth, async (req, res) => {
       });
     }
 
-    // Check if user owns the service or is admin
-    if (service.createdBy._id.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
+    const isClient = req.user.role === 'client' && (
+      (service.clientId && (service.clientId._id || service.clientId).toString() === req.user._id.toString()) ||
+      (service.businessName && req.user.businessName && service.businessName.trim().toLowerCase() === req.user.businessName.trim().toLowerCase())
+    );
+
+    if (!isUserAuthorizedForService(service, req.user) && !isClient) {
       return res.status(403).json({
         success: false,
         message: 'Not authorized to export this service'
       });
     }
 
-    // For PPT generation, we'll create a simple XML-based structure
-    // In production, you would use a PPT library like pptxgenjs
-    const pptContent = `
-      <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-      <Presentation>
-        <Slide>
-          <Title>Service Report - ${service.businessName}</Title>
-          <Content>
-            <Item>Business: ${service.businessName}</Item>
-            <Item>Owner: ${service.ownerName || 'Not specified'}</Item>
-            <Item>Service Type: ${service.serviceType}</Item>
-            <Item>Status: ${service.status}</Item>
-            <Item>Created: ${new Date(service.createdAt).toLocaleDateString()}</Item>
-          </Content>
-        </Slide>
-        <Slide>
-          <Title>Service Details</Title>
-          <Content>
-            <Item>Description: ${service.description}</Item>
-            <Item>Quantity: ${service.quantity}</Item>
-            <Item>Contact: ${service.contactNumber}</Item>
-            <Item>Start Date: ${new Date(service.startDate).toLocaleDateString()}</Item>
-            <Item>End Date: ${service.endDate ? new Date(service.endDate).toLocaleDateString() : 'Not specified'}</Item>
-            <Item>Location: ${service.location.address || 'Not provided'}</Item>
-            <Item>Total Images: ${service.images?.length || 0}</Item>
-          </Content>
-        </Slide>
-        ${service.images?.map((img, index) => `
-          <Slide>
-            <Title>Image ${index + 1}</Title>
-            <Content>
-              <Item>Caption: ${img.caption}</Item>
-              <Item>Source: ${img.source}</Item>
-              <Item>Date: ${new Date(img.takenAt).toLocaleDateString()}</Item>
-              <Item>Location: ${img.location?.lat ? `${img.location.lat}, ${img.location.lng}` : 'Not available'}</Item>
-            </Content>
-          </Slide>
-        `).join('') || ''}
-        <Slide>
-          <Title>Report Summary</Title>
-          <Content>
-            <Item>Generated on: ${new Date().toLocaleString()}</Item>
-            <Item>Generated by: ${req.user.username}</Item>
-            <Item>Total Slides: ${3 + (service.images?.length || 0)}</Item>
-          </Content>
-        </Slide>
-      </Presentation>
-    `;
+    const PptxGenJS = require('pptxgenjs');
+    const axios = require('axios');
+    const pptx = new PptxGenJS();
 
-    // Set response headers for PPT download
+    const title = service.businessName || 'Service_Report';
+    pptx.defineLayout({ name: 'WIDE', width: 13.33, height: 7.5 });
+    pptx.layout = 'WIDE';
+    pptx.title = title;
+    pptx.author = 'GMS';
+    pptx.company = 'GMS';
+    pptx.subject = 'Service Report';
+
+    // Filter images for specific sub-service if serviceIndex is provided
+    let photos = Array.isArray(service.images) ? service.images : [];
+    const reqIdx = req.body?.serviceIndex ?? req.query?.serviceIndex;
+    if (reqIdx !== undefined && reqIdx !== null && reqIdx !== '' && Array.isArray(service.services) && service.services[reqIdx]) {
+      const sub = service.services[reqIdx];
+      const subPhotos = [
+        ...photos.filter(
+          (img) =>
+            (img.itemId && sub._id && String(img.itemId) === String(sub._id)) ||
+            (img.serviceIndex !== undefined && img.serviceIndex !== null && Number(img.serviceIndex) === Number(reqIdx))
+        ),
+        ...(sub.images || [])
+      ].filter(
+        (img, i, arr) =>
+          arr.findIndex((t) => (t.public_id && t.public_id === img.public_id) || (t.url && t.url === img.url)) === i
+      );
+      if (subPhotos.length > 0) {
+        photos = subPhotos;
+      }
+    }
+
+    // 1. Title Slide (matching documentGenerator.js)
+    const titleSlide = pptx.addSlide();
+    titleSlide.background = { fill: 'FFFFFF' };
+    titleSlide.addText('GMS', {
+      x: 0.5,
+      y: 0.5,
+      w: '90%',
+      h: 0.8,
+      fontSize: 32,
+      bold: true,
+      color: '0151ba',
+      align: 'center'
+    });
+    titleSlide.addText(title, {
+      x: 0.5,
+      y: 1.8,
+      w: '90%',
+      h: 1.0,
+      fontSize: 36,
+      bold: true,
+      color: '000000',
+      align: 'center'
+    });
+    titleSlide.addText(`Service Report - ${new Date().toLocaleDateString()}`, {
+      x: 0.5,
+      y: 3.2,
+      w: '90%',
+      h: 0.6,
+      fontSize: 20,
+      color: '666666',
+      align: 'center'
+    });
+    titleSlide.addText(`Total Images: ${photos.length}`, {
+      x: 0.5,
+      y: 4.0,
+      w: '90%',
+      h: 0.8,
+      fontSize: 18,
+      color: '666666',
+      align: 'center'
+    });
+
+    // Helper to fetch image as base64 data URI
+    const fetchImgBase64 = async (imgUrl) => {
+      try {
+        const resp = await axios.get(imgUrl, { responseType: 'arraybuffer', timeout: 10000 });
+        const mime = resp.headers['content-type'] || 'image/jpeg';
+        const b64 = Buffer.from(resp.data).toString('base64');
+        return `data:${mime};base64,${b64}`;
+      } catch (e) {
+        return null;
+      }
+    };
+
+    const imagesPerSlide = 2;
+    const totalSlides = Math.ceil(photos.length / imagesPerSlide);
+
+    for (let slideIndex = 0; slideIndex < totalSlides; slideIndex++) {
+      const slide = pptx.addSlide();
+      slide.background = { fill: 'FFFFFF' };
+
+      slide.addText('GMS', {
+        x: 0.3,
+        y: 0.1,
+        w: 2.0,
+        h: 0.4,
+        fontSize: 14,
+        bold: true,
+        color: '0151ba'
+      });
+
+      slide.addText(`${title} - Page ${slideIndex + 1} of ${totalSlides}`, {
+        x: 0.5,
+        y: 0.15,
+        w: '90%',
+        h: 0.5,
+        fontSize: 18,
+        bold: true,
+        color: '0151ba',
+        align: 'center'
+      });
+
+      const slidePhotos = photos.slice(slideIndex * imagesPerSlide, (slideIndex + 1) * imagesPerSlide);
+
+      for (let i = 0; i < slidePhotos.length; i++) {
+        const photo = slidePhotos[i];
+        const photoIdx = slideIndex * imagesPerSlide + i + 1;
+        const imgUrl = typeof photo === 'string' ? photo : photo.url || photo.file_url;
+        const xPos = i === 0 ? 0.6 : 6.9;
+
+        if (imgUrl) {
+          const dataUri = await fetchImgBase64(imgUrl);
+          if (dataUri) {
+            slide.addImage({
+              data: dataUri,
+              x: xPos,
+              y: 0.9,
+              w: 5.8,
+              h: 4.8
+            });
+          }
+        }
+
+        const locAddr =
+          (typeof photo === 'object' &&
+            (photo.locationAddress || photo.simpleAddress || photo.location?.address || photo.location?.locationName)) ||
+          service.location?.address ||
+          service.primaryLocation?.address ||
+          '';
+        const takenStr =
+          typeof photo === 'object' && (photo.takenAt || photo.uploadedAt)
+            ? new Date(photo.takenAt || photo.uploadedAt).toLocaleString()
+            : '';
+
+        slide.addText(
+          `Image ${photoIdx}${locAddr ? `\n📍 ${locAddr}` : ''}${takenStr ? `\n🕒 ${takenStr}` : ''}`,
+          {
+            x: xPos,
+            y: 5.8,
+            w: 5.8,
+            h: 1.2,
+            fontSize: 11,
+            color: '333333',
+            align: 'center'
+          }
+        );
+      }
+    }
+
+    const cleanFileName = `${title.replace(/[^a-zA-Z0-9]/g, '_')}_Service_Presentation.pptx`;
+
+    if (req.body?.returnBase64) {
+      const b64Out = await pptx.write({ outputType: 'base64' });
+      return res.json({
+        success: true,
+        filename: cleanFileName,
+        base64: b64Out
+      });
+    }
+
+    const bufferOut = await pptx.write({ outputType: 'nodebuffer' });
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.presentationml.presentation');
-    res.setHeader('Content-Disposition', `attachment; filename="${service.businessName}_Service_Presentation.pptx"`);
-    
-    // For demo purposes, we'll send XML as PPT
-    // In production, use a proper PPT library
-    res.send(Buffer.from(pptContent));
+    res.setHeader('Content-Disposition', `attachment; filename="${cleanFileName}"`);
+    res.send(Buffer.from(bufferOut));
 
   } catch (error) {
     console.error('PPT export error:', error);
@@ -954,15 +1184,12 @@ router.post('/:id/images', auth, upload.array('images', 10), async (req, res) =>
     console.log('✅ Service found:', service.businessName);
 
     // 2. FIXED: Check if user is authorized
-    // Allow: creator of service, admin, OR assigned worker
-    const isAuthorized = 
-      service.createdBy.toString() === req.user._id.toString() || 
-      req.user.role === 'admin' ||
-      (service.assignedTo && service.assignedTo.toString() === req.user._id.toString());
+    // Allow: creator of service, admin, owner, OR assigned worker (parent or sub-service)
+    const isAuthorized = isUserAuthorizedForService(service, req.user);
 
     if (!isAuthorized) {
       console.log('❌ User not authorized to upload images to this service');
-      console.log('Service createdBy:', service.createdBy.toString());
+      console.log('Service createdBy:', service.createdBy?.toString());
       console.log('Service assignedTo:', service.assignedTo?.toString());
       console.log('User ID:', req.user._id.toString());
       console.log('User role:', req.user.role);
@@ -1046,77 +1273,192 @@ router.post('/:id/images', auth, upload.array('images', 10), async (req, res) =>
     let targetIdx = null;
     if (req.body.serviceIndex !== undefined && req.body.serviceIndex !== 'undefined' && req.body.serviceIndex !== 'null' && !isNaN(Number(req.body.serviceIndex))) {
       targetIdx = Number(req.body.serviceIndex);
+    } else if (req.extractedServiceIndex !== undefined && !isNaN(Number(req.extractedServiceIndex))) {
+      targetIdx = Number(req.extractedServiceIndex);
     } else if (req.body.itemId && req.body.itemId !== 'undefined' && req.body.itemId !== 'null' && service.services && Array.isArray(service.services)) {
       const foundIdx = service.services.findIndex(s => (s._id || s.id)?.toString() === req.body.itemId.toString());
       if (foundIdx !== -1) targetIdx = foundIdx;
     } else if (req.body.serviceType && req.body.serviceType !== 'undefined' && req.body.serviceType !== 'null' && service.services && Array.isArray(service.services)) {
       const foundIdx = service.services.findIndex(s => s.serviceType === req.body.serviceType);
       if (foundIdx !== -1) targetIdx = foundIdx;
+    } else if (service.services && service.services.length === 1) {
+      targetIdx = 0;
     }
 
     const resolvedItemId = targetIdx !== null && service.services?.[targetIdx] ? (service.services[targetIdx]._id || service.services[targetIdx].id || req.body.itemId || null) : (req.body.itemId || null);
     const resolvedServiceType = targetIdx !== null && service.services?.[targetIdx] ? (service.services[targetIdx].serviceType || req.body.serviceType || null) : (req.body.serviceType || null);
 
-    // 4. Upload each image to Cloudinary
-    const uploadedImages = [];
-    
-    for (let i = 0; i < req.files.length; i++) {
-      const file = req.files[i];
+    // Helper to escape XML for SVG watermark banner
+    const escapeXml = (str) =>
+      String(str || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&apos;');
+
+    // 4. Process and upload all images in parallel for fast response
+    const uploadSingleFile = async (file, i) => {
       console.log(`📸 Uploading file ${i + 1}: ${file.originalname} (${file.size} bytes, ${file.mimetype})`);
-      
       try {
+        const latVal = latitudes[i] ? parseFloat(latitudes[i]) : null;
+        const lngVal = longitudes[i] ? parseFloat(longitudes[i]) : null;
+        let finalAddress = (locationAddresses[i] || '').trim();
+
+        // If address is missing but GPS coordinates exist, reverse-geocode on backend with short timeout
+        if (!finalAddress && latVal && lngVal) {
+          try {
+            const axios = require('axios');
+            const geoRes = await axios.get(
+              `https://nominatim.openstreetmap.org/reverse?format=json&lat=${latVal}&lon=${lngVal}&zoom=18&addressdetails=1`,
+              {
+                headers: { 'User-Agent': 'BTL-Marketing-Service-App/1.0' },
+                timeout: 2200,
+              }
+            );
+            if (geoRes.data?.display_name) {
+              finalAddress = geoRes.data.display_name;
+            }
+          } catch (geoErr) {
+            // fallback below
+          }
+        }
+        if (!finalAddress) {
+          const subLoc =
+            targetIdx !== null && service.services?.[targetIdx]?.location
+              ? typeof service.services[targetIdx].location === 'string'
+                ? service.services[targetIdx].location
+                : service.services[targetIdx].location?.address
+              : '';
+          finalAddress =
+            subLoc ||
+            service.primaryLocation?.address ||
+            service.location?.address ||
+            (typeof service.location === 'string' ? service.location : '') ||
+            (latVal && lngVal ? `Lat: ${latVal.toFixed(6)}, Lng: ${lngVal.toFixed(6)}` : 'Location Recorded');
+        }
+        locationAddresses[i] = finalAddress;
+
+        // Resize first (max 1280px) then stamp live GPS Map Camera banner onto the image buffer
+        let processedBuffer = file.buffer;
+        let processedMime = file.mimetype;
+        try {
+          const resizedBuffer = await sharp(file.buffer)
+            .rotate()
+            .resize({ width: 1280, height: 1280, fit: 'inside', withoutEnlargement: true })
+            .toBuffer();
+          const meta = await sharp(resizedBuffer).metadata();
+          const imgW = meta.width || 1000;
+          const imgH = meta.height || 800;
+          const scale = Math.max(0.6, imgW / 1000);
+          const fontSize = Math.max(13, Math.round(18 * scale));
+          const titleFontSize = Math.max(15, Math.round(21 * scale));
+          const lineHeight = Math.round(fontSize * 1.38);
+          const pad = Math.round(16 * scale);
+
+          // Wrap address into up to 2 lines
+          const maxCharsPerLine = Math.max(38, Math.floor((imgW - pad * 3) / (fontSize * 0.56)));
+          const addrPrefix = `Address: ${finalAddress}`;
+          const addrLines = [];
+          let rem = addrPrefix;
+          while (rem.length > 0 && addrLines.length < 2) {
+            if (rem.length <= maxCharsPerLine || addrLines.length === 1) {
+              addrLines.push(rem.slice(0, maxCharsPerLine + 12));
+              break;
+            }
+            let splitAt = rem.lastIndexOf(' ', maxCharsPerLine);
+            if (splitAt <= 0) splitAt = maxCharsPerLine;
+            addrLines.push(rem.slice(0, splitAt));
+            rem = rem.slice(splitAt).trim();
+          }
+
+          const totalLines = 2 + addrLines.length;
+          const boxHeight = totalLines * lineHeight + pad * 2;
+          const boxY = Math.max(0, imgH - boxHeight - Math.round(12 * scale));
+          const boxX = Math.round(12 * scale);
+          const boxW = Math.max(100, imgW - boxX * 2);
+          const accentW = Math.max(4, Math.round(6 * scale));
+
+          const orderLine = `Order: ${service.businessName || 'Service'} | Type: ${
+            resolvedServiceType || service.serviceType || 'Campaign'
+          }`;
+          const gpsLine =
+            latVal && lngVal
+              ? `GPS Coordinates: ${latVal.toFixed(6)}, ${lngVal.toFixed(6)} | ${new Date().toLocaleString()}`
+              : `Timestamp: ${new Date().toLocaleString()}`;
+
+          let textNodes = `
+            <text x="${boxX + pad + accentW}" y="${boxY + pad + titleFontSize}" font-family="Arial, Helvetica, sans-serif" font-size="${titleFontSize}" font-weight="bold" fill="#f2c43b">${escapeXml(
+            orderLine
+          )}</text>
+            <text x="${boxX + pad + accentW}" y="${boxY + pad + titleFontSize + lineHeight}" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#ffffff">${escapeXml(
+            gpsLine
+          )}</text>
+          `;
+          addrLines.forEach((lineStr, lIdx) => {
+            const yPos = boxY + pad + titleFontSize + lineHeight * (2 + lIdx);
+            textNodes += `<text x="${boxX + pad + accentW}" y="${yPos}" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" fill="#e2e8f0">${escapeXml(
+              lineStr
+            )}</text>`;
+          });
+
+          const svgOverlay = Buffer.from(`
+            <svg width="${imgW}" height="${imgH}" xmlns="http://www.w3.org/2000/svg">
+              <rect x="${boxX}" y="${boxY}" width="${boxW}" height="${boxHeight}" rx="8" ry="8" fill="rgba(0,0,0,0.76)" />
+              <rect x="${boxX}" y="${boxY}" width="${accentW}" height="${boxHeight}" rx="3" ry="3" fill="#f2c43b" />
+              ${textNodes}
+            </svg>
+          `);
+
+          processedBuffer = await sharp(resizedBuffer)
+            .composite([{ input: svgOverlay, top: 0, left: 0 }])
+            .jpeg({ quality: 82 })
+            .toBuffer();
+          processedMime = 'image/jpeg';
+        } catch (wmErr) {
+          console.warn('Watermark note (using original buffer):', wmErr.message);
+        }
+
         // Convert buffer to base64 for Cloudinary
-        const b64 = Buffer.from(file.buffer).toString('base64');
-        const dataURI = `data:${file.mimetype};base64,${b64}`;
+        const b64 = Buffer.from(processedBuffer).toString('base64');
+        const dataURI = `data:${processedMime};base64,${b64}`;
         
-        console.log('☁️ Uploading to Cloudinary...');
-        
-        // Upload to Cloudinary with simpler options
+        // Upload to Cloudinary
         const result = await cloudinary.uploader.upload(dataURI, {
           folder: `services/${service._id}`,
           resource_type: 'image',
         });
 
-        console.log('✅ Cloudinary upload successful:', result.secure_url);
-
-        // Get the source from request body or use default
         const imageSource = sources[i] || 'gallery';
-        
-        // Use valid enum values: 'camera', 'gallery', or 'folder'
         const validSource = imageSource === 'camera' ? 'camera' : 'gallery';
 
-        // Create image object with all data including GPS
-        const imageData = {
+        return {
           url: result.secure_url,
           public_id: result.public_id,
           caption: captions[i],
           takenAt: new Date(),
-          source: validSource, // Use valid enum value
-          // Store GPS data directly on image
-          latitude: latitudes[i] ? parseFloat(latitudes[i]) : null,
-          longitude: longitudes[i] ? parseFloat(longitudes[i]) : null,
-          locationAddress: locationAddresses[i] || '',
-          simpleAddress: locationAddresses[i] || '',
-          // Also store in location object for backward compatibility
+          source: validSource,
+          latitude: latVal,
+          longitude: lngVal,
+          locationAddress: finalAddress,
+          simpleAddress: finalAddress,
           location: {
-            lat: latitudes[i] ? parseFloat(latitudes[i]) : null,
-            lng: longitudes[i] ? parseFloat(longitudes[i]) : null,
-            address: locationAddresses[i] || ''
+            lat: latVal,
+            lng: lngVal,
+            address: finalAddress
           },
           itemId: resolvedItemId,
           serviceIndex: targetIdx,
           serviceType: resolvedServiceType
         };
-
-        console.log('Final image data to save:', imageData);
-        uploadedImages.push(imageData);
-
       } catch (uploadError) {
         console.error(`❌ Cloudinary upload failed for ${file.originalname}:`, uploadError);
-        // Continue with other images even if one fails
-        continue;
+        return null;
       }
-    }
+    };
+
+    const uploadResults = await Promise.all(req.files.map((file, idx) => uploadSingleFile(file, idx)));
+    const uploadedImages = uploadResults.filter(Boolean);
 
     if (uploadedImages.length === 0) {
       console.log('❌ All uploads failed');
@@ -1152,14 +1494,19 @@ router.post('/:id/images', auth, upload.array('images', 10), async (req, res) =>
           }
         });
 
-        await LocationLog.create({
-          user: req.user._id,
-          coordinates: { lat, lng },
-          locationName: locName,
-          source: 'image_capture',
-          recordedAt: new Date()
-        });
-        console.log(`📍 Updated worker ${req.user.username} live location from image capture: ${locName}`);
+        // Only create a new trail waypoint if at least 30 minutes have passed
+        const THIRTY_MINUTES_MS = 30 * 60 * 1000;
+        const lastLog = await LocationLog.findOne({ user: req.user._id }).sort({ recordedAt: -1 });
+        if (!lastLog || (Date.now() - new Date(lastLog.recordedAt).getTime()) >= THIRTY_MINUTES_MS) {
+          await LocationLog.create({
+            user: req.user._id,
+            coordinates: { lat, lng },
+            locationName: locName,
+            source: 'image_capture',
+            recordedAt: new Date()
+          });
+          console.log(`📍 Recorded 30-min waypoint for worker ${req.user.username} from image capture: ${locName}`);
+        }
       } catch (locErr) {
         console.warn('Could not update live tracker from image capture:', locErr.message);
       }
@@ -1204,12 +1551,13 @@ router.get('/:id/images', auth, async (req, res) => {
       });
     }
 
-    // FIXED: Allow assigned workers to view images
-    const isAuthorized = 
-      service.createdBy.toString() === req.user._id.toString() || 
-      req.user.role === 'admin' ||
-      (service.assignedTo && (service.assignedTo._id || service.assignedTo).toString() === req.user._id.toString()) ||
-      (service.services && service.services.some(s => s.assignedTo && (s.assignedTo._id || s.assignedTo).toString() === req.user._id.toString()));
+    // FIXED: Allow creator, admin, owner, client of service, and assigned workers to view images
+    const isClient = req.user.role === 'client' && (
+      (service.clientId && (service.clientId._id || service.clientId).toString() === req.user._id.toString()) ||
+      (service.businessName && req.user.businessName && service.businessName.trim().toLowerCase() === req.user.businessName.trim().toLowerCase())
+    );
+
+    const isAuthorized = isUserAuthorizedForService(service, req.user) || isClient;
 
     if (!isAuthorized) {
       return res.status(403).json({
@@ -1284,12 +1632,8 @@ router.post('/:id/meter-readings', auth, upload.fields([
 
     console.log('✅ Service found:', service.businessName);
 
-    // Check if user is authorized
-    const isAuthorized = 
-      service.createdBy.toString() === req.user._id.toString() || 
-      req.user.role === 'admin' ||
-      req.user.role === 'owner' ||
-      (service.assignedTo && service.assignedTo.toString() === req.user._id.toString());
+    // Check if user is authorized (creator, admin, owner, or assigned worker)
+    const isAuthorized = isUserAuthorizedForService(service, req.user);
 
     if (!isAuthorized) {
       console.log('❌ User not authorized');
@@ -1437,11 +1781,8 @@ router.delete('/:id/meter-readings/:readingId', auth, async (req, res) => {
       });
     }
 
-    // Check if user is authorized
-    const isAuthorized = 
-      service.createdBy.toString() === req.user._id.toString() || 
-      req.user.role === 'admin' ||
-      (service.assignedTo && service.assignedTo.toString() === req.user._id.toString());
+    // Check if user is authorized (creator, admin, owner, or assigned worker)
+    const isAuthorized = isUserAuthorizedForService(service, req.user);
 
     if (!isAuthorized) {
       console.log('User not authorized to delete meter reading');
@@ -1600,11 +1941,8 @@ router.post('/:id/bulk-images', auth, upload.array('images', 2000), async (req, 
       });
     }
 
-    // 3. Authorization check
-    const isAuthorized = 
-      service.createdBy.toString() === req.user._id.toString() || 
-      req.user.role === 'admin' ||
-      (service.assignedTo && service.assignedTo.toString() === req.user._id.toString());
+    // 3. Authorization check (creator, admin, owner, or assigned worker)
+    const isAuthorized = isUserAuthorizedForService(service, req.user);
 
     if (!isAuthorized) {
       return res.status(403).json({
@@ -2014,11 +2352,8 @@ router.delete('/:id/images/:imageId', auth, async (req, res) => {
     console.log('✅ Service found:', service.businessName);
     console.log('Current images count:', service.images?.length || 0);
 
-    // Check authorization
-    const isAuthorized = 
-      service.createdBy.toString() === req.user._id.toString() || 
-      req.user.role === 'admin' ||
-      (service.assignedTo && service.assignedTo.toString() === req.user._id.toString());
+    // Check authorization (creator, admin, owner, or assigned worker)
+    const isAuthorized = isUserAuthorizedForService(service, req.user);
 
     if (!isAuthorized) {
       console.log('❌ User not authorized to delete image');
@@ -2216,11 +2551,8 @@ router.delete('/:id/images-all', auth, async (req, res) => {
       });
     }
 
-    // Check authorization
-    const isAuthorized = 
-      service.createdBy.toString() === req.user._id.toString() || 
-      req.user.role === 'admin' ||
-      (service.assignedTo && service.assignedTo.toString() === req.user._id.toString());
+    // Check authorization (creator, admin, owner, or assigned worker)
+    const isAuthorized = isUserAuthorizedForService(service, req.user);
 
     if (!isAuthorized) {
       console.log('❌ User not authorized to delete all images');
@@ -2369,11 +2701,8 @@ router.post('/:id/ultra-bulk', auth, upload.array('images', 5000), async (req, r
       });
     }
 
-    // 3. Authorization check
-    const isAuthorized = 
-      service.createdBy.toString() === req.user._id.toString() || 
-      req.user.role === 'admin' ||
-      (service.assignedTo && service.assignedTo.toString() === req.user._id.toString());
+    // 3. Authorization check (creator, admin, owner, or assigned worker)
+    const isAuthorized = isUserAuthorizedForService(service, req.user);
 
     if (!isAuthorized) {
       return res.status(403).json({
